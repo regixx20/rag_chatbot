@@ -1,0 +1,160 @@
+:root {
+  color-scheme: light dark;
+  font-family: 'Inter', system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI',
+    sans-serif;
+  background-color: #0f172a;
+  color: #e2e8f0;
+}
+
+body {
+  margin: 0;
+}
+
+.app-container {
+  min-height: 100vh;
+  display: flex;
+  flex-direction: column;
+  padding: 2rem;
+  gap: 2rem;
+  background: radial-gradient(circle at top left, #1e293b, #0f172a);
+}
+
+header h1 {
+  margin: 0;
+  font-size: 2.5rem;
+}
+
+header p {
+  margin: 0.5rem 0 0;
+  color: #cbd5f5;
+}
+
+main {
+  display: grid;
+  grid-template-columns: 2fr 1fr;
+  gap: 2rem;
+}
+
+.chat-window {
+  display: flex;
+  flex-direction: column;
+  background-color: rgba(15, 23, 42, 0.8);
+  border-radius: 1rem;
+  border: 1px solid rgba(148, 163, 184, 0.3);
+  backdrop-filter: blur(10px);
+  box-shadow: 0 20px 40px rgba(15, 23, 42, 0.45);
+}
+
+.messages {
+  flex: 1;
+  padding: 1.5rem;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 1rem;
+}
+
+.message {
+  padding: 1rem;
+  border-radius: 0.75rem;
+  background-color: rgba(30, 41, 59, 0.9);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.05);
+}
+
+.message.user {
+  background-color: rgba(56, 189, 248, 0.2);
+  align-self: flex-end;
+}
+
+.message strong {
+  display: block;
+  margin-bottom: 0.5rem;
+  color: #f8fafc;
+}
+
+.chat-form {
+  display: flex;
+  gap: 1rem;
+  padding: 1.5rem;
+  border-top: 1px solid rgba(148, 163, 184, 0.2);
+}
+
+.chat-form input {
+  flex: 1;
+  padding: 0.75rem 1rem;
+  border-radius: 0.75rem;
+  border: none;
+  background-color: rgba(51, 65, 85, 0.9);
+  color: #f8fafc;
+}
+
+.chat-form button {
+  padding: 0.75rem 1.5rem;
+  border-radius: 0.75rem;
+  border: none;
+  background: linear-gradient(135deg, #38bdf8, #8b5cf6);
+  color: #0f172a;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.sidebar {
+  display: flex;
+  flex-direction: column;
+  gap: 1.5rem;
+}
+
+.upload-panel,
+.document-list {
+  background-color: rgba(15, 23, 42, 0.85);
+  border-radius: 1rem;
+  padding: 1.5rem;
+  border: 1px solid rgba(148, 163, 184, 0.2);
+}
+
+.upload-panel form {
+  display: flex;
+  flex-direction: column;
+  gap: 1rem;
+}
+
+.upload-panel button {
+  padding: 0.75rem 1.5rem;
+  border-radius: 0.75rem;
+  border: none;
+  background: linear-gradient(135deg, #22d3ee, #818cf8);
+  color: #0f172a;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.status {
+  margin-top: 0.5rem;
+  color: #cbd5f5;
+}
+
+.document-list ul {
+  list-style: none;
+  padding: 0;
+  margin: 1rem 0 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+}
+
+.document-list li {
+  padding: 0.5rem 0.75rem;
+  background-color: rgba(30, 41, 59, 0.8);
+  border-radius: 0.5rem;
+}
+
+.document-list .empty {
+  margin: 0;
+  color: #94a3b8;
+}
+
+@media (max-width: 1024px) {
+  main {
+    grid-template-columns: 1fr;
+  }
+}
