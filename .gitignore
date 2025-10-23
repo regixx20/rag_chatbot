@@ -1,0 +1,10 @@
+__pycache__/
+*.py[cod]
+*.sqlite3
+.env
+faiss_index/
+media/uploads/
+node_modules/
+frontend/dist/
+.vscode/
+.DS_Store
