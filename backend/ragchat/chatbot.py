@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Iterable, List
 
 from dotenv import load_dotenv
+
 from langchain_community.vectorstores import FAISS
 from langchain_community.document_loaders import (
     CSVLoader,
@@ -17,7 +18,9 @@ from langchain_community.document_loaders import (
     UnstructuredMarkdownLoader,
     UnstructuredXMLLoader,
 )
-from langchain.text_splitter import RecursiveCharacterTextSplitter
+
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+
 from langchain_core.documents import Document
 from langchain_core.messages import AIMessage
 from langchain_openai import ChatOpenAI, OpenAIEmbeddings
@@ -42,7 +45,8 @@ class ChatbotEngine:
             raise RuntimeError("OPENAI_API_KEY must be provided in the environment.")
 
         self.model = ChatOpenAI(api_key=self.api_key, model=self.llm_name)
-        self.embedding = OpenAIEmbeddings(openai_api_key=self.api_key)
+        self.embedding = OpenAIEmbeddings(api_key=self.api_key)
+
         self.text_splitter = RecursiveCharacterTextSplitter(
             chunk_size=1000, chunk_overlap=200
         )
@@ -116,9 +120,7 @@ class ChatbotEngine:
         has_docs = len(context.strip()) > 100
         intent = self._classify_intent(message)
 
-        if intent == "playbook_writing":
-            response = self._call_playbook_generator(message, context)
-        elif intent == "question" and has_docs:
+        if intent == "Rag" and has_docs:
             response = self._call_rag_response(message, context)
         else:
             response = self._call_direct_response(message)
@@ -135,13 +137,14 @@ class ChatbotEngine:
             "Voici un message utilisateur :\n"
             f'"{message}"\n\n'
             "Catégorise-le dans une des classes suivantes :\n"
-            "- playbook_writing\n- question\n- autre\n\n"
-            "Réponds uniquement par l’un des trois mots : playbook_writing, question, autre."
+            "Rag, NotRag\n\n"
+            "Réponds uniquement par l’un des deux mots : Rag, NotRag."
         )
-        label = self.model.invoke(prompt).content.strip().lower()
-        if label not in {"playbook_writing", "question", "autre"}:
-            return "question"
-        return label
+        label = self.model.invoke(prompt).content.strip()
+        normalized = label.replace(" ", "").lower()
+        if normalized == "rag":
+            return "Rag"
+        return "NotRag"
 
     def _call_rag_response(self, message: str, context: str) -> AIMessage:
         prompt = (
@@ -154,20 +157,6 @@ class ChatbotEngine:
 
     def _call_direct_response(self, message: str) -> AIMessage:
         return self.model.invoke(message)
-
-    def _call_playbook_generator(self, message: str, context: str) -> AIMessage:
-        prompt = (
-            "Voici des extraits de documents :\n"
-            f"{context}\n"
-            "Tu es un assistant expert en cybersécurité chargé de créer un playbook automatisé.\n\n"
-            "En te basant uniquement sur ces extraits et de la demande suivante de l'utilisateur,\n"
-            "génère un playbook clair en te basant sur les instructions pour créer un playbook qui sont"
-            " dans le fichier \"instructions_to_create_a_playbook.txt\".\n\n"
-            "Demande de l'utilisateur :\n"
-            f'"""{message}"""\n\n'
-            "Il faut que tu répondes en écrivant juste le playbook"
-        )
-        return self.model.invoke(prompt)
 
     # ------------------------------------------------------------------
     # File loader helpers
@@ -182,7 +171,16 @@ class ChatbotEngine:
         return documents
 
     def _load_documents_from_path(self, path: Path) -> list[Document]:
-        loader: CSVLoader | Docx2txtLoader | JSONLoader | PyPDFLoader | TextLoader | UnstructuredHTMLLoader | UnstructuredMarkdownLoader | UnstructuredXMLLoader
+        loader: (
+            CSVLoader
+            | Docx2txtLoader
+            | JSONLoader
+            | PyPDFLoader
+            | TextLoader
+            | UnstructuredHTMLLoader
+            | UnstructuredMarkdownLoader
+            | UnstructuredXMLLoader
+        )
         documents: list[Document] = []
         if not path.exists():
             return documents

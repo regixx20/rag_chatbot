@@ -8,3 +8,5 @@ node_modules/
 frontend/dist/
 .vscode/
 .DS_Store
+.venv
+venv

@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 from backend.ragchat.chatbot import get_engine
+from dotenv import load_dotenv
+load_dotenv()  
 
 
 def main() -> None:
