@@ -20,9 +20,9 @@ from .serializers import (
 
 
 class DocumentViewSet(viewsets.ModelViewSet):
-    queryset = Document.objects.all()
-    serializer_class = DocumentSerializer
-    parser_classes = [MultiPartParser]
+    queryset = Document.objects.all()  # define which objects ModelViewSet works with
+    serializer_class = DocumentSerializer # automatic by ModelViewSet to validate and format data
+    parser_classes = [MultiPartParser] # parser to tranform request body into request data
 
     def perform_create(self, serializer: DocumentSerializer) -> None:  # type: ignore[override]
         uploaded_file = serializer.validated_data["file"]
