@@ -1,6 +1,7 @@
 """Core chatbot logic shared by API endpoints."""
 from __future__ import annotations
 
+import logging
 import os
 from pathlib import Path
 from typing import Iterable, List
@@ -27,6 +28,8 @@ from langchain_openai import ChatOpenAI, OpenAIEmbeddings
 
 load_dotenv()
 
+logger = logging.getLogger(__name__)
+
 
 class ChatbotEngine:
     """Encapsulates the RAG pipeline and exposes chat/upload helpers."""
@@ -52,6 +55,12 @@ class ChatbotEngine:
         )
 
         self._vector_store: FAISS | None = None
+        logger.info(
+            "Initialisation du moteur de chatbot avec les dossiers docs=%s, index=%s et modèle=%s",
+            self.docs_path,
+            self.index_path,
+            self.llm_name,
+        )
         self._load_or_create_index()
 
     # ------------------------------------------------------------------
@@ -59,18 +68,27 @@ class ChatbotEngine:
     # ------------------------------------------------------------------
     def _load_or_create_index(self) -> None:
         if self.index_path.exists():
+            logger.info("Chargement de l'index FAISS existant depuis %s", self.index_path)
             self._vector_store = FAISS.load_local(
                 str(self.index_path),
                 self.embedding,
                 allow_dangerous_deserialization=True,
             )
         else:
+            logger.info(
+                "Aucun index existant trouvé. Chargement des documents pour créer un nouvel index."
+            )
             documents = self._load_all_documents(self.docs_path)
             if documents:
                 split_docs = self.text_splitter.split_documents(documents)
                 self._vector_store = FAISS.from_documents(split_docs, self.embedding)
                 self.index_path.mkdir(parents=True, exist_ok=True)
                 self._vector_store.save_local(str(self.index_path))
+                logger.info(
+                    "Index FAISS initialisé avec %s documents et sauvegardé dans %s",
+                    len(split_docs),
+                    self.index_path,
+                )
             else:
                 self._vector_store = None
 
@@ -83,8 +101,10 @@ class ChatbotEngine:
         loaded_documents: list[Document] = []
         ingested_sources: set[str] = set()
         for path in paths:
+            logger.info("Ingestion du fichier %s", path)
             documents = self._load_documents_from_path(path)
             if not documents:
+                logger.warning("Aucun document chargé depuis %s", path)
                 continue
             split_docs = self.text_splitter.split_documents(documents)
             loaded_documents.extend(split_docs)
@@ -93,15 +113,28 @@ class ChatbotEngine:
             )
 
         if not loaded_documents:
+            logger.warning("Aucun document ingéré. L'index n'a pas été mis à jour.")
             return []
 
         if self._vector_store is None:
             self._vector_store = FAISS.from_documents(loaded_documents, self.embedding)
+            logger.info(
+                "Création d'un nouvel index FAISS avec %s fragments de documents", len(loaded_documents)
+            )
         else:
             self._vector_store.add_documents(loaded_documents)
+            logger.info(
+                "Ajout de %s fragments de documents à l'index FAISS existant",
+                len(loaded_documents),
+            )
 
         self.index_path.mkdir(parents=True, exist_ok=True)
         self._vector_store.save_local(str(self.index_path))
+        logger.info(
+            "Index FAISS sauvegardé dans %s. Sources ingérées : %s",
+            self.index_path,
+            sorted(ingested_sources),
+        )
         return sorted(ingested_sources)
 
     # ------------------------------------------------------------------
@@ -110,15 +143,23 @@ class ChatbotEngine:
     def chat(self, message: str) -> tuple[str, str, list[str]]:
         """Return the assistant answer, detected intent and supporting documents."""
 
+        logger.info("Réception d'un message utilisateur : %s", message)
+
         if self._vector_store is None:
             retrieved_docs: list[Document] = []
         else:
             retriever = self._vector_store.as_retriever()
             retrieved_docs = retriever.invoke(message)
 
+        logger.info(
+            "Documents récupérés : %s",
+            [doc.metadata.get("source", "Unknown source") for doc in retrieved_docs],
+        )
+
         context = "\n\n".join(doc.page_content for doc in retrieved_docs)
         has_docs = len(context.strip()) > 100
         intent = self._classify_intent(message)
+        logger.info("Intention détectée : %s", intent)
 
         if intent == "Rag" and has_docs:
             response = self._call_rag_response(message, context)
@@ -126,6 +167,8 @@ class ChatbotEngine:
             response = self._call_direct_response(message)
 
         used_sources = [doc.metadata.get("source", "Unknown source") for doc in retrieved_docs]
+        logger.info("Réponse générée : %s", response.content)
+        logger.info("Sources utilisées : %s", used_sources)
         return response.content, intent, used_sources
 
     # ------------------------------------------------------------------
@@ -140,7 +183,9 @@ class ChatbotEngine:
             "Rag, NotRag\n\n"
             "Réponds uniquement par l’un des deux mots : Rag, NotRag."
         )
+        logger.info("Envoi au LLM pour classification : %s", prompt)
         label = self.model.invoke(prompt).content.strip()
+        logger.info("Réponse du LLM pour la classification : %s", label)
         normalized = label.replace(" ", "").lower()
         if normalized == "rag":
             return "Rag"
@@ -153,10 +198,16 @@ class ChatbotEngine:
             "En te basant uniquement sur ces extraits, réponds à cette question :\n"
             f"{message}"
         )
-        return self.model.invoke(prompt)
+        logger.info("Envoi au LLM (RAG) avec le prompt : %s", prompt)
+        response = self.model.invoke(prompt)
+        logger.info("Réponse du LLM (RAG) : %s", response.content)
+        return response
 
     def _call_direct_response(self, message: str) -> AIMessage:
-        return self.model.invoke(message)
+        logger.info("Envoi au LLM (direct) du message : %s", message)
+        response = self.model.invoke(message)
+        logger.info("Réponse du LLM (direct) : %s", response.content)
+        return response
 
     # ------------------------------------------------------------------
     # File loader helpers

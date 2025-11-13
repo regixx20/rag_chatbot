@@ -1,6 +1,7 @@
 """API endpoints for the RAG chatbot."""
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 
 from django.conf import settings
@@ -19,6 +20,9 @@ from .serializers import (
 )
 
 
+logger = logging.getLogger(__name__)
+
+
 class DocumentViewSet(viewsets.ModelViewSet):
     queryset = Document.objects.all()  # define which objects ModelViewSet works with
     serializer_class = DocumentSerializer # automatic by ModelViewSet to validate and format data
@@ -26,18 +30,34 @@ class DocumentViewSet(viewsets.ModelViewSet):
 
     def perform_create(self, serializer: DocumentSerializer) -> None:  # type: ignore[override]
         uploaded_file = serializer.validated_data["file"]
+        logger.info(
+            "Téléversement reçu : nom=%s, taille=%s octets", uploaded_file.name, uploaded_file.size
+        )
         document: Document = serializer.save(original_name=uploaded_file.name)
         engine = get_engine()
-        engine.ingest_files([Path(document.file.path)])
+        ingested_sources = engine.ingest_files([Path(document.file.path)])
+        logger.info(
+            "Ingestion terminée pour %s. Sources ingérées : %s",
+            uploaded_file.name,
+            ingested_sources,
+        )
 
     @action(detail=False, methods=["post"], url_path="ingest")
     def ingest_existing(self, request, *args, **kwargs):
         engine = get_engine()
         docs_dir = Path(settings.BASE_DIR) / "docs"
         if not docs_dir.exists():
+            logger.warning(
+                "Demande d'ingestion de documents existants mais le dossier %s est introuvable",
+                docs_dir,
+            )
             return Response({"ingested_sources": []})
         file_paths = [path for path in docs_dir.glob("**/*") if path.is_file()]
+        logger.info(
+            "Ingestion manuelle déclenchée pour %s fichiers existants", len(file_paths)
+        )
         ingested = engine.ingest_files(file_paths)
+        logger.info("Ingestion existante terminée. Sources ingérées : %s", ingested)
         return Response({"ingested_sources": ingested})
 
 
@@ -47,8 +67,13 @@ class ChatView(APIView):
         serializer.is_valid(raise_exception=True)
 
         engine = get_engine()
-        answer, intent, sources = engine.chat(serializer.validated_data["message"])
+        message = serializer.validated_data["message"]
+        logger.info("Requête de chat reçue : %s", message)
+        answer, intent, sources = engine.chat(message)
         response_serializer = ChatResponseSerializer(
             {"response": answer, "intent": intent, "used_documents": sources}
+        )
+        logger.info(
+            "Réponse envoyée au client. Intention=%s, documents=%s", intent, sources
         )
         return Response(response_serializer.data, status=status.HTTP_200_OK)
