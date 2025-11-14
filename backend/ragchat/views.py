@@ -68,8 +68,9 @@ class ChatView(APIView):
 
         engine = get_engine()
         message = serializer.validated_data["message"]
-        logger.info("Requête de chat reçue : %s", message)
-        answer, intent, sources = engine.chat(message)
+        mode = serializer.validated_data["mode"]
+        logger.info("Requête de chat reçue : %s (mode=%s)", message, mode)
+        answer, intent, sources = engine.chat(message, mode=mode)
         response_serializer = ChatResponseSerializer(
             {"response": answer, "intent": intent, "used_documents": sources}
         )
