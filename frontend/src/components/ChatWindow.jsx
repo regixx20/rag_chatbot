@@ -13,7 +13,10 @@ export default function ChatWindow({ apiBase, refreshKey }) {
   const [messages, setMessages] = useState([])
   const [input, setInput] = useState('')
   const [loading, setLoading] = useState(false)
+  const [mode, setMode] = useState('direct')
+  const [showModeMenu, setShowModeMenu] = useState(false)
   const bottomRef = useRef(null)
+  const modeSelectorRef = useRef(null)
 
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: 'smooth' })
@@ -23,20 +26,43 @@ export default function ChatWindow({ apiBase, refreshKey }) {
     setMessages([])
   }, [refreshKey])
 
+  useEffect(() => {
+    if (!showModeMenu) return
+
+    const handleClickOutside = (event) => {
+      if (modeSelectorRef.current?.contains(event.target)) return
+      setShowModeMenu(false)
+    }
+
+    document.addEventListener('mousedown', handleClickOutside)
+
+    return () => {
+      document.removeEventListener('mousedown', handleClickOutside)
+    }
+  }, [showModeMenu])
+
   const handleSubmit = async (event) => {
     event.preventDefault()
-    if (!input.trim()) return
+    const trimmedInput = input.trim()
+    if (!trimmedInput) return
 
-    const newMessages = [...messages, { author: 'user', content: input }]
-    setMessages(newMessages)
+    const previousMessages = messages
+    const userMessage = { author: 'user', content: trimmedInput }
+    const updatedMessages = [...previousMessages, userMessage]
+    setMessages(updatedMessages)
     setInput('')
     setLoading(true)
 
     try {
+      const historyPayload = previousMessages.map(({ author, content }) => ({
+        role: author,
+        content
+      }))
+
       const response = await fetch(`${apiBase}/chat/`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ message: input })
+        body: JSON.stringify({ message: trimmedInput, mode, history: historyPayload })
       })
 
       if (!response.ok) {
@@ -59,6 +85,18 @@ export default function ChatWindow({ apiBase, refreshKey }) {
     }
   }
 
+  const handleModeChange = (nextMode) => {
+    setMode(nextMode)
+    setShowModeMenu(false)
+  }
+
+  const clearMode = () => {
+    setMode('direct')
+    setShowModeMenu(false)
+  }
+
+  const modeLabel = mode === 'rag' ? 'Mode RAG' : 'Mode Libre'
+
   return (
     <div className="chat-window">
       <div className="messages">
@@ -68,12 +106,64 @@ export default function ChatWindow({ apiBase, refreshKey }) {
         <div ref={bottomRef} />
       </div>
       <form onSubmit={handleSubmit} className="chat-form">
-        <input
-          value={input}
-          onChange={(event) => setInput(event.target.value)}
-          placeholder="Posez votre question..."
-          disabled={loading}
-        />
+        <div className="input-wrapper">
+          {mode === 'rag' && (
+            <span className="mode-chip">
+              {modeLabel}
+              <button
+                type="button"
+                onClick={clearMode}
+                aria-label="Désactiver le mode RAG"
+                disabled={loading}
+              >
+                ×
+              </button>
+            </span>
+          )}
+          <input
+            value={input}
+            onChange={(event) => setInput(event.target.value)}
+            placeholder="Posez votre question..."
+            disabled={loading}
+          />
+          <div className="mode-selector" ref={modeSelectorRef}>
+            <button
+              type="button"
+              className="mode-button"
+              onClick={() => setShowModeMenu((open) => !open)}
+              aria-haspopup="menu"
+              aria-expanded={showModeMenu}
+              aria-label="Choisir le mode de réponse"
+              disabled={loading}
+            >
+              +
+            </button>
+            {showModeMenu && (
+              <div className="mode-menu" role="menu">
+                <button
+                  type="button"
+                  onClick={() => handleModeChange('rag')}
+                  className={mode === 'rag' ? 'active' : ''}
+                  role="menuitemradio"
+                  aria-checked={mode === 'rag'}
+                  disabled={loading}
+                >
+                  Mode RAG
+                </button>
+                <button
+                  type="button"
+                  onClick={() => handleModeChange('direct')}
+                  className={mode === 'direct' ? 'active' : ''}
+                  role="menuitemradio"
+                  aria-checked={mode === 'direct'}
+                  disabled={loading}
+                >
+                  Mode Libre
+                </button>
+              </div>
+            )}
+          </div>
+        </div>
         <button type="submit" disabled={loading}>
           {loading ? 'Envoi...' : 'Envoyer'}
         </button>

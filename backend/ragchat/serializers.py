@@ -13,8 +13,15 @@ class DocumentSerializer(serializers.ModelSerializer):
         read_only_fields = ["id", "uploaded_at", "original_name"]
 
 
+class ChatMessageSerializer(serializers.Serializer):
+    role = serializers.ChoiceField(choices=["user", "assistant"])
+    content = serializers.CharField()
+
+
 class ChatRequestSerializer(serializers.Serializer): # input format messages for validation of messages sent by users
     message = serializers.CharField()
+    mode = serializers.ChoiceField(choices=["rag", "direct"], default="rag")
+    history = ChatMessageSerializer(many=True, required=False, default=list)
 
 
 class ChatResponseSerializer(serializers.Serializer):  # output format for chat responses
