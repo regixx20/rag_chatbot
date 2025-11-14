@@ -140,7 +140,12 @@ class ChatbotEngine:
     # ------------------------------------------------------------------
     # Chat interaction
     # ------------------------------------------------------------------
-    def chat(self, message: str, mode: str = "rag") -> tuple[str, str, list[str]]:
+    def chat(
+        self,
+        message: str,
+        mode: str = "rag",
+        history: Iterable[dict[str, str]] | None = None,
+    ) -> tuple[str, str, list[str]]:
         """Return the assistant answer, selected mode and supporting documents."""
 
         logger.info("Réception d'un message utilisateur : %s", message)
@@ -148,6 +153,9 @@ class ChatbotEngine:
         normalized_mode = mode.lower()
         if normalized_mode not in {"rag", "direct"}:
             raise ValueError(f"Mode de chat invalide : {mode}")
+
+        history_entries = list(history or [])
+        history_text = self._render_history(history_entries)
 
         retrieved_docs: list[Document] = []
         if normalized_mode == "rag" and self._vector_store is not None:
@@ -172,23 +180,40 @@ class ChatbotEngine:
                 )
                 return response_text, "Rag", used_sources
 
-            response = self._call_rag_response(message, context)
+            response = self._call_rag_response(message, context, history_text)
             logger.info("Réponse générée (RAG) : %s", response.content)
             logger.info("Sources utilisées : %s", used_sources)
             return response.content, "Rag", used_sources
 
-        response = self._call_direct_response(message)
+        response = self._call_direct_response(message, history_text)
         logger.info("Réponse générée (direct) : %s", response.content)
         return response.content, "Direct", []
 
     # ------------------------------------------------------------------
     # Prompt helpers
     # ------------------------------------------------------------------
-    def _call_rag_response(self, message: str, context: str) -> AIMessage:
+    def _render_history(self, history: Iterable[dict[str, str]]) -> str:
+        lines: list[str] = []
+        for entry in history:
+            role = entry.get("role", "user")
+            content = entry.get("content", "").strip()
+            if not content:
+                continue
+            speaker = "Utilisateur" if role == "user" else "Assistant"
+            lines.append(f"{speaker} : {content}")
+        return "\n".join(lines)
+
+    def _call_rag_response(self, message: str, context: str, history_text: str) -> AIMessage:
+        conversation_block = (
+            f"Historique de la conversation :\n{history_text}\n\n"
+            if history_text
+            else ""
+        )
         prompt = (
+            f"{conversation_block}"
             "Voici des extraits de documents :\n"
             f"{context}\n\n"
-            "En te basant uniquement sur ces extraits, réponds à cette question :\n"
+            "En te basant uniquement sur ces extraits, réponds à la question suivante :\n"
             f"{message}\n\n"
             "Si les documents ne contiennent pas l'information demandée, dis-le explicitement"
             " sans inventer de réponse."
@@ -198,9 +223,20 @@ class ChatbotEngine:
         logger.info("Réponse du LLM (RAG) : %s", response.content)
         return response
 
-    def _call_direct_response(self, message: str) -> AIMessage:
-        logger.info("Envoi au LLM (direct) du message : %s", message)
-        response = self.model.invoke(message)
+    def _call_direct_response(self, message: str, history_text: str) -> AIMessage:
+        conversation_block = (
+            f"Historique de la conversation :\n{history_text}\n\n"
+            if history_text
+            else ""
+        )
+        prompt = (
+            f"{conversation_block}"
+            "Dernière question de l'utilisateur :\n"
+            f"{message}\n\n"
+            "Réponds de manière utile, concise et en français."
+        )
+        logger.info("Envoi au LLM (direct) du message : %s", prompt)
+        response = self.model.invoke(prompt)
         logger.info("Réponse du LLM (direct) : %s", response.content)
         return response
 

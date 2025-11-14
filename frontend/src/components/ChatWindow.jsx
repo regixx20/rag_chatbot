@@ -43,18 +43,26 @@ export default function ChatWindow({ apiBase, refreshKey }) {
 
   const handleSubmit = async (event) => {
     event.preventDefault()
-    if (!input.trim()) return
+    const trimmedInput = input.trim()
+    if (!trimmedInput) return
 
-    const newMessages = [...messages, { author: 'user', content: input }]
-    setMessages(newMessages)
+    const previousMessages = messages
+    const userMessage = { author: 'user', content: trimmedInput }
+    const updatedMessages = [...previousMessages, userMessage]
+    setMessages(updatedMessages)
     setInput('')
     setLoading(true)
 
     try {
+      const historyPayload = previousMessages.map(({ author, content }) => ({
+        role: author,
+        content
+      }))
+
       const response = await fetch(`${apiBase}/chat/`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ message: input, mode })
+        body: JSON.stringify({ message: trimmedInput, mode, history: historyPayload })
       })
 
       if (!response.ok) {
