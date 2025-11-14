@@ -20,7 +20,7 @@ class ChatMessageSerializer(serializers.Serializer):
 
 class ChatRequestSerializer(serializers.Serializer): # input format messages for validation of messages sent by users
     message = serializers.CharField()
-    mode = serializers.ChoiceField(choices=["rag", "direct"], default="rag")
+    mode = serializers.ChoiceField(choices=["rag", "direct"])
     history = ChatMessageSerializer(many=True, required=False, default=list)
 
 
