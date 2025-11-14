@@ -10,7 +10,7 @@ class DocumentSerializer(serializers.ModelSerializer):
     class Meta: # manage upload of file and represent data for api
         model = Document
         fields = ["id", "original_name", "file", "uploaded_at"]
-        read_only_fields = ["id", "uploaded_at"]
+        read_only_fields = ["id", "uploaded_at", "original_name"]
 
 
 class ChatRequestSerializer(serializers.Serializer): # input format messages for validation of messages sent by users
