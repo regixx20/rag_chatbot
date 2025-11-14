@@ -15,6 +15,7 @@ class DocumentSerializer(serializers.ModelSerializer):
 
 class ChatRequestSerializer(serializers.Serializer): # input format messages for validation of messages sent by users
     message = serializers.CharField()
+    mode = serializers.ChoiceField(choices=["rag", "direct"], default="rag")
 
 
 class ChatResponseSerializer(serializers.Serializer):  # output format for chat responses

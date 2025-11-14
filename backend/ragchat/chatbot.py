@@ -140,14 +140,17 @@ class ChatbotEngine:
     # ------------------------------------------------------------------
     # Chat interaction
     # ------------------------------------------------------------------
-    def chat(self, message: str) -> tuple[str, str, list[str]]:
-        """Return the assistant answer, detected intent and supporting documents."""
+    def chat(self, message: str, mode: str = "rag") -> tuple[str, str, list[str]]:
+        """Return the assistant answer, selected mode and supporting documents."""
 
         logger.info("Réception d'un message utilisateur : %s", message)
 
-        if self._vector_store is None:
-            retrieved_docs: list[Document] = []
-        else:
+        normalized_mode = mode.lower()
+        if normalized_mode not in {"rag", "direct"}:
+            raise ValueError(f"Mode de chat invalide : {mode}")
+
+        retrieved_docs: list[Document] = []
+        if normalized_mode == "rag" and self._vector_store is not None:
             retriever = self._vector_store.as_retriever()
             retrieved_docs = retriever.invoke(message)
 
@@ -156,47 +159,39 @@ class ChatbotEngine:
             [doc.metadata.get("source", "Unknown source") for doc in retrieved_docs],
         )
 
-        context = "\n\n".join(doc.page_content for doc in retrieved_docs)
-        has_docs = len(context.strip()) > 100
-        intent = self._classify_intent(message)
-        logger.info("Intention détectée : %s", intent)
-
-        if intent == "Rag" and has_docs:
-            response = self._call_rag_response(message, context)
-        else:
-            response = self._call_direct_response(message)
-
         used_sources = [doc.metadata.get("source", "Unknown source") for doc in retrieved_docs]
-        logger.info("Réponse générée : %s", response.content)
-        logger.info("Sources utilisées : %s", used_sources)
-        return response.content, intent, used_sources
+
+        if normalized_mode == "rag":
+            context = "\n\n".join(doc.page_content for doc in retrieved_docs)
+            if not context.strip():
+                logger.info(
+                    "Aucun contexte disponible pour le mode RAG. Réponse informative envoyée.")
+                response_text = (
+                    "Je n'ai trouvé aucune information pertinente dans les documents fournis."
+                    " Merci d'ajouter des documents contenant la réponse recherchée."
+                )
+                return response_text, "Rag", used_sources
+
+            response = self._call_rag_response(message, context)
+            logger.info("Réponse générée (RAG) : %s", response.content)
+            logger.info("Sources utilisées : %s", used_sources)
+            return response.content, "Rag", used_sources
+
+        response = self._call_direct_response(message)
+        logger.info("Réponse générée (direct) : %s", response.content)
+        return response.content, "Direct", []
 
     # ------------------------------------------------------------------
     # Prompt helpers
     # ------------------------------------------------------------------
-    def _classify_intent(self, message: str) -> str:
-        prompt = (
-            "Tu es un classifieur d’intention.\n\n"
-            "Voici un message utilisateur :\n"
-            f'"{message}"\n\n'
-            "Catégorise-le dans une des classes suivantes :\n"
-            "Rag, NotRag\n\n"
-            "Réponds uniquement par l’un des deux mots : Rag, NotRag."
-        )
-        logger.info("Envoi au LLM pour classification : %s", prompt)
-        label = self.model.invoke(prompt).content.strip()
-        logger.info("Réponse du LLM pour la classification : %s", label)
-        normalized = label.replace(" ", "").lower()
-        if normalized == "rag":
-            return "Rag"
-        return "NotRag"
-
     def _call_rag_response(self, message: str, context: str) -> AIMessage:
         prompt = (
             "Voici des extraits de documents :\n"
             f"{context}\n\n"
             "En te basant uniquement sur ces extraits, réponds à cette question :\n"
-            f"{message}"
+            f"{message}\n\n"
+            "Si les documents ne contiennent pas l'information demandée, dis-le explicitement"
+            " sans inventer de réponse."
         )
         logger.info("Envoi au LLM (RAG) avec le prompt : %s", prompt)
         response = self.model.invoke(prompt)
