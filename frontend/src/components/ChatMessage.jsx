@@ -32,18 +32,6 @@ export function ChatMessage({ message }) {
         <div className={`chat-message-bubble ${isUser ? 'bubble-user' : 'bubble-assistant'}`}>
           <p>{message.content}</p>
         </div>
-        {hasSources && (
-          <div className="chat-message-sources">
-            <span>Sources :</span>
-            <ul>
-              {message.usedDocuments.map((doc) => {
-                const label =
-                  typeof doc === 'string' ? doc.split(/[\/]/).pop() || doc : 'Document'
-                return <li key={doc}>{label}</li>
-              })}
-            </ul>
-          </div>
-        )}
         <span className="chat-message-time">
           {message.timestamp
             ? new Date(message.timestamp).toLocaleTimeString('fr-FR', {
