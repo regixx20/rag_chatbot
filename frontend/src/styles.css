@@ -17,7 +17,7 @@
   --radius-lg: 24px;
   --radius-md: 16px;
   --radius-sm: 12px;
-  font-size: var(--font-size);
+  font-size: 13px;
 }
 
 * {
@@ -25,6 +25,7 @@
 }
 
 body {
+
   margin: 0;
   font-family: var(--font-family-base);
   background: radial-gradient(circle at 0% 0%, #eef1ff 0%, #f5f5fa 35%, #ecf1ff 70%, #f5f5fa 100%);
