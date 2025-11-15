@@ -26,9 +26,13 @@ from langchain_core.documents import Document
 from langchain_core.messages import AIMessage
 from langchain_openai import ChatOpenAI, OpenAIEmbeddings
 
+from langdetect import DetectorFactory, LangDetectException, detect
+
 load_dotenv()
 
 logger = logging.getLogger(__name__)
+
+DetectorFactory.seed = 0
 
 
 class ChatbotEngine:
@@ -62,6 +66,26 @@ class ChatbotEngine:
             self.llm_name,
         )
         self._load_or_create_index()
+
+        self._language_names = {
+            "ar": "arabe",
+            "de": "allemand",
+            "en": "anglais",
+            "es": "espagnol",
+            "fr": "français",
+            "hi": "hindi",
+            "it": "italien",
+            "ja": "japonais",
+            "ko": "coréen",
+            "nl": "néerlandais",
+            "pl": "polonais",
+            "pt": "portugais",
+            "ru": "russe",
+            "sv": "suédois",
+            "tr": "turc",
+            "zh-cn": "chinois simplifié",
+            "zh-tw": "chinois traditionnel",
+        }
 
     # ------------------------------------------------------------------
     # Index bootstrap helpers
@@ -150,6 +174,9 @@ class ChatbotEngine:
 
         logger.info("Réception d'un message utilisateur : %s", message)
 
+        detected_language = self._detect_language(message)
+        language_instruction = self._build_language_instruction(detected_language)
+
         normalized_mode = mode.lower()
         if normalized_mode not in {"rag", "direct"}:
             raise ValueError(f"Mode de chat invalide : {mode}")
@@ -174,18 +201,19 @@ class ChatbotEngine:
             if not context.strip():
                 logger.info(
                     "Aucun contexte disponible pour le mode RAG. Réponse informative envoyée.")
-                response_text = (
-                    "Je n'ai trouvé aucune information pertinente dans les documents fournis."
-                    " Merci d'ajouter des documents contenant la réponse recherchée."
+                response = self._call_no_context_response(
+                    message, history_text, language_instruction
                 )
-                return response_text, "Rag", used_sources
+                return response.content, "Rag", used_sources
 
-            response = self._call_rag_response(message, context, history_text)
+            response = self._call_rag_response(
+                message, context, history_text, language_instruction
+            )
             logger.info("Réponse générée (RAG) : %s", response.content)
             logger.info("Sources utilisées : %s", used_sources)
             return response.content, "Rag", used_sources
 
-        response = self._call_direct_response(message, history_text)
+        response = self._call_direct_response(message, history_text, language_instruction)
         logger.info("Réponse générée (direct) : %s", response.content)
         return response.content, "Direct", []
 
@@ -203,7 +231,13 @@ class ChatbotEngine:
             lines.append(f"{speaker} : {content}")
         return "\n".join(lines)
 
-    def _call_rag_response(self, message: str, context: str, history_text: str) -> AIMessage:
+    def _call_rag_response(
+        self,
+        message: str,
+        context: str,
+        history_text: str,
+        language_instruction: str,
+    ) -> AIMessage:
         conversation_block = (
             f"Historique de la conversation :\n{history_text}\n\n"
             if history_text
@@ -216,14 +250,17 @@ class ChatbotEngine:
             "En te basant uniquement sur ces extraits, réponds à la question suivante :\n"
             f"{message}\n\n"
             "Si les documents ne contiennent pas l'information demandée, dis-le explicitement"
-            " sans inventer de réponse."
+            " sans inventer de réponse.\n"
+            f"{language_instruction}"
         )
         logger.info("Envoi au LLM (RAG) avec le prompt : %s", prompt)
         response = self.model.invoke(prompt)
         logger.info("Réponse du LLM (RAG) : %s", response.content)
         return response
 
-    def _call_direct_response(self, message: str, history_text: str) -> AIMessage:
+    def _call_direct_response(
+        self, message: str, history_text: str, language_instruction: str
+    ) -> AIMessage:
         conversation_block = (
             f"Historique de la conversation :\n{history_text}\n\n"
             if history_text
@@ -233,12 +270,54 @@ class ChatbotEngine:
             f"{conversation_block}"
             "Dernière question de l'utilisateur :\n"
             f"{message}\n\n"
-            "Réponds de manière utile, concise et en français."
+            "Réponds de manière utile et concise.\n"
+            f"{language_instruction}"
         )
         logger.info("Envoi au LLM (direct) du message : %s", prompt)
         response = self.model.invoke(prompt)
         logger.info("Réponse du LLM (direct) : %s", response.content)
         return response
+
+    def _call_no_context_response(
+        self, message: str, history_text: str, language_instruction: str
+    ) -> AIMessage:
+        prompt = (
+            "Tu n'as trouvé aucune information pertinente dans les documents fournis.\n"
+            "Explique cette situation à l'utilisateur de manière polie et suggère d'ajouter"
+            " des documents contenant la réponse recherchée.\n"
+            f"Question de l'utilisateur : {message}\n"
+            f"Historique disponible : {history_text if history_text else 'Aucun'}\n\n"
+            f"{language_instruction}"
+        )
+        logger.info("Envoi au LLM (RAG - pas de contexte) du message : %s", prompt)
+        response = self.model.invoke(prompt)
+        logger.info("Réponse du LLM (RAG - pas de contexte) : %s", response.content)
+        return response
+
+    def _detect_language(self, message: str) -> str:
+        cleaned_message = message.strip()
+        if not cleaned_message:
+            return "en"
+        try:
+            detected = detect(cleaned_message)
+            logger.debug("Langue détectée : %s", detected)
+            return detected
+        except LangDetectException:
+            logger.warning(
+                "Impossible de détecter la langue du message. Utilisation de l'anglais par défaut."
+            )
+            return "en"
+
+    def _build_language_instruction(self, language_code: str) -> str:
+        language_name = self._language_names.get(language_code.lower(), language_code)
+        if language_name == language_code:
+            return (
+                "Réponds dans la langue associée au code ISO "
+                f"'{language_code}' détecté pour la question de l'utilisateur."
+            )
+        return (
+            f"Réponds en {language_name} (code ISO détecté : {language_code})."
+        )
 
     # ------------------------------------------------------------------
     # File loader helpers
