@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import logging
 import os
+import shutil
 from pathlib import Path
 from typing import Iterable, List
 
@@ -160,6 +161,31 @@ class ChatbotEngine:
             sorted(ingested_sources),
         )
         return sorted(ingested_sources)
+
+    def rebuild_index(self, extra_paths: Iterable[Path] | None = None) -> None:
+        """Rebuild the FAISS index from scratch using all known documents."""
+
+        logger.info("Reconstruction complète de l'index FAISS demandée")
+        documents = self._load_all_documents(self.docs_path)
+        for path in extra_paths or []:
+            documents.extend(self._load_documents_from_path(path))
+
+        if not documents:
+            logger.info(
+                "Aucun document disponible. L'index FAISS sera supprimé et désactivé."
+            )
+            self._vector_store = None
+            if self.index_path.exists():
+                shutil.rmtree(self.index_path)
+            return
+
+        split_docs = self.text_splitter.split_documents(documents)
+        self._vector_store = FAISS.from_documents(split_docs, self.embedding)
+        self.index_path.mkdir(parents=True, exist_ok=True)
+        self._vector_store.save_local(str(self.index_path))
+        logger.info(
+            "Index FAISS reconstruit avec %s fragments de documents", len(split_docs)
+        )
 
     # ------------------------------------------------------------------
     # Chat interaction
