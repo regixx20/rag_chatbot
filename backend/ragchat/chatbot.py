@@ -190,6 +190,22 @@ class ChatbotEngine:
     # ------------------------------------------------------------------
     # Chat interaction
     # ------------------------------------------------------------------
+    def _has_documents(self) -> bool:
+        """Return True when the FAISS store currently tracks at least one chunk."""
+
+        if self._vector_store is None:
+            return False
+        index = getattr(self._vector_store, "index", None)
+        if index is None:
+            return False
+        total = getattr(index, "ntotal", None)
+        if total is None:
+            return True
+        try:
+            return int(total) > 0
+        except (TypeError, ValueError):
+            return False
+
     def chat(
         self,
         message: str,
@@ -209,6 +225,19 @@ class ChatbotEngine:
 
         history_entries = list(history or [])
         history_text = self._render_history(history_entries)
+
+        has_documents = self._has_documents()
+
+        if not has_documents:
+            logger.info(
+                "Aucun document n'est indexé actuellement. Réponse informative retournée."
+            )
+            warning = (
+                "Aucun document n'est disponible pour répondre à cette question. "
+                "Téléversez un fichier dans le panneau 'Documents RAG' et activez le "
+                "mode RAG pour obtenir une réponse contextuelle."
+            )
+            return warning, "NoDocuments", []
 
         retrieved_docs: list[Document] = []
         if normalized_mode == "rag" and self._vector_store is not None:

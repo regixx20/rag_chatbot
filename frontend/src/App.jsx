@@ -15,6 +15,7 @@ const INITIAL_ASSISTANT_MESSAGE = {
     "Bonjour ! Posez votre question et activez le mode RAG pour enrichir les réponses avec vos documents.",
   role: 'assistant',
   timestamp: new Date(),
+  intent: 'System',
 }
 
 function createMessageId(prefix = 'msg') {
@@ -101,6 +102,7 @@ export default function App() {
         content: trimmed,
         role: 'user',
         timestamp: new Date(),
+        intent: 'User',
       }
 
       setMessages((previous) => [...previous, userMessage])
@@ -131,6 +133,7 @@ export default function App() {
           role: 'assistant',
           timestamp: new Date(),
           usedDocuments: Array.isArray(data.used_documents) ? data.used_documents : [],
+          intent: data.intent || 'Direct',
         }
 
         setMessages((previous) => [...previous, assistantMessage])
@@ -142,6 +145,7 @@ export default function App() {
           content: "Une erreur est survenue. Vérifiez votre connexion à l'API.",
           role: 'assistant',
           timestamp: new Date(),
+          intent: 'Error',
         }
         setMessages((previous) => [...previous, fallbackMessage])
       } finally {
@@ -264,11 +268,7 @@ export default function App() {
 
         <div className="chat-messages">
           {messages.map((message) => (
-            <ChatMessage
-              key={message.id}
-              message={message}
-              showRagBadge={Boolean(isRagEnabled && message.role === 'assistant')}
-            />
+            <ChatMessage key={message.id} message={message} />
           ))}
           {isLoading && (
             <div className="chat-loading">
