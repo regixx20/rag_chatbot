@@ -42,6 +42,36 @@ class DocumentViewSet(viewsets.ModelViewSet):
             ingested_sources,
         )
 
+    def perform_destroy(self, instance: Document) -> None:  # type: ignore[override]
+        file_path = Path(instance.file.path) if instance.file else None
+        document_name = instance.original_name
+        logger.info("Suppression du document %s demandée", document_name)
+
+        if instance.file:
+            instance.file.delete(save=False)
+        instance.delete()
+
+        remaining_paths = [
+            Path(doc.file.path)
+            for doc in Document.objects.all()
+            if doc.file and doc.file.name
+        ]
+
+        engine = get_engine()
+        engine.rebuild_index(remaining_paths)
+
+        if file_path and file_path.exists():
+            try:
+                file_path.unlink()
+            except FileNotFoundError:
+                pass
+
+        logger.info(
+            "Document %s supprimé. Index RAG reconstruit à partir des %s fichiers restants",
+            document_name,
+            len(remaining_paths),
+        )
+
     @action(detail=False, methods=["post"], url_path="ingest")
     def ingest_existing(self, request, *args, **kwargs):
         engine = get_engine()
