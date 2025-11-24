@@ -9,6 +9,25 @@ import { SparklesIcon, DatabaseIcon } from './components/icons'
 
 const DEFAULT_API_BASE = 'http://localhost:8000/api'
 
+
+function inferApiBaseUrl() {
+  const envBase = import.meta.env.VITE_API_BASE_URL
+  if (envBase) {
+    return envBase
+  }
+
+  if (typeof window !== 'undefined') {
+    const { origin, hostname } = window.location
+    const isLocalhost = ['localhost', '127.0.0.1', '0.0.0.0'].includes(hostname)
+
+    if (!isLocalhost) {
+      return `${origin.replace(/\/$/, '')}/api`
+    }
+  }
+
+  return DEFAULT_API_BASE
+}
+
 const INITIAL_ASSISTANT_MESSAGE = {
   id: 'welcome',
   content:
@@ -43,7 +62,7 @@ function normaliseDocument(apiDocument) {
 }
 
 export default function App() {
-  const [apiBase] = useState(() => import.meta.env.VITE_API_BASE_URL || DEFAULT_API_BASE)
+  const [apiBase] = useState(inferApiBaseUrl)
   const [documents, setDocuments] = useState([])
   const [messages, setMessages] = useState([INITIAL_ASSISTANT_MESSAGE])
   const [isRagEnabled, setIsRagEnabled] = useState(false)
