@@ -1,13 +1,14 @@
 """Core chatbot logic shared by API endpoints."""
 from __future__ import annotations
 
+
 import logging
 import os
 import shutil
 from pathlib import Path
 from typing import Iterable, List
 
-from dotenv import load_dotenv
+
 
 from langchain_community.vectorstores import FAISS
 from langchain_community.document_loaders import (
@@ -29,7 +30,7 @@ from langchain_openai import ChatOpenAI, OpenAIEmbeddings
 
 from langdetect import DetectorFactory, LangDetectException, detect
 
-load_dotenv()
+
 
 logger = logging.getLogger(__name__)
 
@@ -445,8 +446,19 @@ class ChatbotEngine:
 _ENGINE: ChatbotEngine | None = None
 
 
+_ENGINE: ChatbotEngine | None = None
+_ENGINE_KEY: str | None = None
+
 def get_engine() -> ChatbotEngine:
-    global _ENGINE
-    if _ENGINE is None:
+    global _ENGINE, _ENGINE_KEY
+    current_key = os.getenv("OPENAI_API_KEY")
+
+    if not current_key:
+        raise RuntimeError("OPENAI_API_KEY must be provided in the environment.")
+
+    # Rebuild engine if first time OR if key changed
+    if _ENGINE is None or current_key != _ENGINE_KEY:
         _ENGINE = ChatbotEngine()
+        _ENGINE_KEY = current_key
+
     return _ENGINE
