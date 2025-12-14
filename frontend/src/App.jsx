@@ -9,9 +9,11 @@ import { SparklesIcon, DatabaseIcon } from './components/icons'
 
 const DEFAULT_API_BASE = 'http://localhost:8000/api'
 
+const PROD_DEFAULT_API_BASE = 'https://rag-chatbot-shbz.onrender.com/api'
 
 function inferApiBaseUrl() {
-  const envBase = import.meta.env.VITE_API_BASE_URL
+  const envBase = import.meta.env.VITE_API_BASE_URL?.replace(/\/$/, '')
+  
   if (envBase) {
     return envBase
   }
@@ -21,7 +23,11 @@ function inferApiBaseUrl() {
     const isLocalhost = ['localhost', '127.0.0.1', '0.0.0.0'].includes(hostname)
 
     if (!isLocalhost) {
-      return `${origin.replace(/\/$/, '')}/api`
+      const normalisedOrigin = origin.replace(/\/$/, '')
+      if (hostname.endsWith('onrender.com')) {
+        return PROD_DEFAULT_API_BASE
+      }
+      return `${normalisedOrigin}/api`
     }
   }
 
