@@ -13,3 +13,4 @@ langchain-text-splitters
 python-dotenv
 unstructured
 langdetect
+gunicorn
