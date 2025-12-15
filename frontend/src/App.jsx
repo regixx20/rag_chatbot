@@ -11,8 +11,30 @@ const DEFAULT_API_BASE = 'http://localhost:8000/api'
 
 const PROD_DEFAULT_API_BASE = 'https://rag-chatbot-shbz.onrender.com/api'
 
+const FALLBACK_ENV_KEYS = [
+  'VITE_API_BASE_URL',
+  'VITE_PUBLIC_API_BASE_URL',
+  'PUBLIC_API_BASE_URL',
+  'NEXT_PUBLIC_API_BASE_URL',
+]
+
+function normaliseBaseUrl(url) {
+  if (!url) return ''
+  return url.replace(/\/$/, '')
+}
+
+function readEnvApiBase() {
+  for (const key of FALLBACK_ENV_KEYS) {
+    const value = import.meta.env?.[key]
+    if (value) {
+      return normaliseBaseUrl(value)
+    }
+  }
+  return null
+}
+
 function inferApiBaseUrl() {
-  const envBase = import.meta.env.VITE_API_BASE_URL?.replace(/\/$/, '')
+  const envBase = readEnvApiBase()
   
   if (envBase) {
     return envBase
@@ -23,11 +45,7 @@ function inferApiBaseUrl() {
     const isLocalhost = ['localhost', '127.0.0.1', '0.0.0.0'].includes(hostname)
 
     if (!isLocalhost) {
-      const normalisedOrigin = origin.replace(/\/$/, '')
-      if (hostname.endsWith('onrender.com')) {
-        return PROD_DEFAULT_API_BASE
-      }
-      return `${normalisedOrigin}/api`
+      return `${normaliseBaseUrl(origin)}/api`
     }
   }
 
