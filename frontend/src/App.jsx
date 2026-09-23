@@ -1,13 +1,10 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
-import { ChatInput } from './components/ChatInput'
-import { ChatMessage } from './components/ChatMessage'
-import { DocumentPanel } from './components/DocumentPanel'
-import { ServerStatus } from './components/ServerStatus'
-import { Badge } from './components/ui/Badge'
-import { Button } from './components/ui/Button'
-import { Switch } from './components/ui/Switch'
-import { Label } from './components/ui/Label'
-import { SparklesIcon, DatabaseIcon, FileTextIcon, RefreshIcon } from './components/icons'
+import { Menu, SquarePen } from 'lucide-react'
+import { Sidebar } from './components/Sidebar'
+import { EmptyState } from './components/EmptyState'
+import { Message } from './components/Message'
+import { Composer } from './components/Composer'
+import { Toast } from './components/Toast'
 import {
   ApiError,
   UPLOAD_TIMEOUT_MS,
@@ -16,48 +13,22 @@ import {
   resolveApiBase,
   streamChat,
 } from './lib/api'
+import { useTheme } from './lib/useTheme'
 
-// Extensions the backend knows how to load (see ChatbotEngine._load_documents_from_path)
+// Extensions the backend knows how to load (see ragchat/chatbot.py)
 export const ACCEPTED_FILE_TYPES = '.pdf,.txt,.docx,.md,.html,.htm,.xml,.json,.csv'
 
-const SUGGESTIONS = {
-  direct: [
-    "Explique-moi ce qu'est le RAG en quelques phrases",
-    'Quelle est la différence entre un embedding et un token ?',
-    'Donne-moi 3 idées de projets utilisant un chatbot',
-  ],
-  rag: [
-    'TikTok peut-il réutiliser mes vidéos ?',
-    'À partir de quel âge peut-on créer un compte ?',
-    'Comment sont réglés les litiges avec TikTok ?',
-  ],
-}
-
-function createWelcomeMessage() {
-  return {
-    id: 'welcome',
-    content:
-      "Bonjour ! Le **mode RAG** est activé : je réponds à partir des documents disponibles, en citant mes sources. Un document de démo est déjà chargé (les conditions d'utilisation de TikTok) — posez une question, ou ajoutez vos propres fichiers.",
-    role: 'assistant',
-    timestamp: new Date(),
-    intent: 'System',
-  }
-}
-
-function createMessageId(prefix = 'msg') {
+function createId(prefix) {
   return `${prefix}-${Date.now()}-${Math.random().toString(16).slice(2)}`
 }
 
 function normaliseDocument(apiDocument) {
   if (!apiDocument) return null
-
-  const name = apiDocument.original_name || apiDocument.file || 'Document'
-  const extension = typeof name === 'string' && name.includes('.') ? name.split('.').pop() ?? '' : ''
-
+  const name = apiDocument.original_name || 'Document'
   return {
-    id: String(apiDocument.id ?? createMessageId('doc')),
+    id: String(apiDocument.id ?? createId('doc')),
     name,
-    type: apiDocument.type || extension,
+    extension: name.includes('.') ? name.split('.').pop().toLowerCase() : '',
     isDemo: Boolean(apiDocument.is_demo),
     uploadedAt: apiDocument.uploaded_at ? new Date(apiDocument.uploaded_at) : null,
   }
@@ -65,29 +36,28 @@ function normaliseDocument(apiDocument) {
 
 export default function App() {
   const [apiBase] = useState(resolveApiBase)
+  const [theme, toggleTheme] = useTheme()
   const [serverState, setServerState] = useState('waking') // waking | online | offline
   const [documents, setDocuments] = useState([])
-  const [messages, setMessages] = useState(() => [createWelcomeMessage()])
+  const [messages, setMessages] = useState([])
   const [isRagEnabled, setIsRagEnabled] = useState(true)
   const [isLoading, setIsLoading] = useState(false)
   const [isUploading, setIsUploading] = useState(false)
-  const [isPanelOpen, setIsPanelOpen] = useState(false)
-  const [statusMessage, setStatusMessage] = useState(null)
+  const [isSidebarOpen, setIsSidebarOpen] = useState(false)
+  const [isDragging, setIsDragging] = useState(false)
+  const [toast, setToast] = useState(null)
 
   const fileInputRef = useRef(null)
-  const messagesEndRef = useRef(null)
+  const scrollRef = useRef(null)
+  const composerRef = useRef(null)
+  const dragDepth = useRef(0)
+
+  const notify = useCallback((text, tone = 'info') => setToast({ text, tone, id: Date.now() }), [])
 
   const fetchDocuments = useCallback(async () => {
     try {
       const data = await apiFetch(`${apiBase}/documents/`, { timeout: WAKE_TIMEOUT_MS })
-      const results = Array.isArray(data?.results) ? data.results : data
-      if (!Array.isArray(results)) return
-      setDocuments(
-        results
-          .map(normaliseDocument)
-          .filter(Boolean)
-          .sort((a, b) => (b.uploadedAt?.getTime() ?? 0) - (a.uploadedAt?.getTime() ?? 0))
-      )
+      if (Array.isArray(data)) setDocuments(data.map(normaliseDocument).filter(Boolean))
     } catch (error) {
       console.error('Impossible de charger les documents', error)
     }
@@ -113,72 +83,55 @@ export default function App() {
     wakeServer()
   }, [wakeServer])
 
+  // Keep the latest message in view while an answer streams in
   useEffect(() => {
-    messagesEndRef.current?.scrollIntoView({ behavior: 'smooth', block: 'end' })
+    const container = scrollRef.current
+    if (!container) return
+    const nearBottom = container.scrollHeight - container.scrollTop - container.clientHeight < 240
+    if (nearBottom || isLoading) container.scrollTo({ top: container.scrollHeight, behavior: 'smooth' })
   }, [messages, isLoading])
 
-  const showStatus = (text, tone = 'info') => setStatusMessage({ text, tone })
-
-  const handleSendMessage = useCallback(
+  const sendMessage = useCallback(
     async (content, baseMessages = messages) => {
       const trimmed = content.trim()
       if (!trimmed || isLoading) return
 
-      const userMessage = {
-        id: createMessageId('user'),
-        content: trimmed,
-        role: 'user',
-        timestamp: new Date(),
-        intent: 'User',
-      }
-
       const history = baseMessages
-        .filter((entry) => entry.intent !== 'System' && entry.intent !== 'Error')
+        .filter((entry) => entry.status !== 'error')
         .map(({ role, content: text }) => ({ role, content: text }))
+      const mode = isRagEnabled ? 'rag' : 'direct'
+      const assistantId = createId('assistant')
 
-      const assistantId = createMessageId('assistant')
-      setMessages([...baseMessages, userMessage])
+      setMessages([
+        ...baseMessages,
+        { id: createId('user'), role: 'user', content: trimmed },
+        { id: assistantId, role: 'assistant', content: '', mode, status: 'searching', sources: [] },
+      ])
       setIsLoading(true)
-      setStatusMessage(null)
 
-      const updateAssistant = (patch) =>
-        setMessages((previous) => {
-          const exists = previous.some((entry) => entry.id === assistantId)
-          const base = exists
-            ? previous
-            : [...previous, { id: assistantId, role: 'assistant', content: '', timestamp: new Date() }]
-          return base.map((entry) => (entry.id === assistantId ? { ...entry, ...patch(entry) } : entry))
-        })
+      const update = (patch) =>
+        setMessages((previous) =>
+          previous.map((entry) => (entry.id === assistantId ? { ...entry, ...patch(entry) } : entry))
+        )
 
       try {
         await streamChat(
           apiBase,
-          { message: trimmed, mode: isRagEnabled ? 'rag' : 'direct', history },
+          { message: trimmed, mode, history },
           {
             onMeta: ({ intent, sources }) =>
-              updateAssistant(() => ({ intent: intent || 'Direct', sources: sources ?? [], isStreaming: true })),
-            onToken: (token) => updateAssistant((entry) => ({ content: entry.content + token })),
+              update(() => ({ intent, sources: sources ?? [], status: 'writing' })),
+            onToken: (token) => update((entry) => ({ content: entry.content + token, status: 'writing' })),
           }
         )
         setServerState('online')
-        updateAssistant((entry) => ({
-          isStreaming: false,
+        update((entry) => ({
+          status: 'done',
           content: entry.content || "Je n'ai pas pu formuler de réponse.",
         }))
       } catch (error) {
         console.error("Erreur lors de l'envoi du message", error)
-        // Drop a partially streamed answer and show the error instead
-        setMessages((previous) => [
-          ...previous.filter((entry) => entry.id !== assistantId),
-          {
-            id: createMessageId('assistant-error'),
-            content: error.message,
-            role: 'assistant',
-            timestamp: new Date(),
-            intent: 'Error',
-            retryContent: trimmed,
-          },
-        ])
+        update(() => ({ status: 'error', content: error.message, retryContent: trimmed }))
       } finally {
         setIsLoading(false)
       }
@@ -186,28 +139,21 @@ export default function App() {
     [apiBase, isLoading, isRagEnabled, messages]
   )
 
-  const handleRetry = useCallback(
+  const retry = useCallback(
     (message) => {
-      // Drop the failed exchange and resend the same question
+      // Resend the same question with the history that preceded it
       const index = messages.findIndex((entry) => entry.id === message.id)
-      if (index < 1) return
-      handleSendMessage(message.retryContent, messages.slice(0, index - 1))
+      if (index > 0) sendMessage(message.retryContent, messages.slice(0, index - 1))
     },
-    [handleSendMessage, messages]
+    [messages, sendMessage]
   )
 
-  const handleUploadDocuments = useCallback(
+  const uploadDocuments = useCallback(
     async (fileList) => {
       const files = Array.from(fileList ?? [])
-      if (files.length === 0) return
+      if (files.length === 0 || serverState !== 'online') return
 
       setIsUploading(true)
-      showStatus(
-        files.length > 1
-          ? `Analyse de ${files.length} documents en cours…`
-          : `Analyse de « ${files[0].name} » en cours…`
-      )
-
       const uploaded = []
       for (const file of files) {
         const formData = new FormData()
@@ -222,190 +168,150 @@ export default function App() {
           if (parsed) uploaded.push(parsed)
         } catch (error) {
           console.error('Erreur de téléversement', error)
-          showStatus(`Impossible d'ajouter « ${file.name} » : ${error.message}`, 'error')
-          break
+          notify(`« ${file.name} » : ${error.message}`, 'error')
         }
       }
-
       setIsUploading(false)
+
       if (uploaded.length > 0) {
         setDocuments((previous) => [...uploaded, ...previous])
         setIsRagEnabled(true)
-        showStatus(
-          `${uploaded.length} document${uploaded.length > 1 ? 's ajoutés' : ' ajouté'}. Le mode RAG est activé.`,
+        notify(
+          uploaded.length > 1
+            ? `${uploaded.length} documents ajoutés à votre base`
+            : `« ${uploaded[0].name} » ajouté à votre base`,
           'success'
         )
       }
     },
-    [apiBase]
+    [apiBase, notify, serverState]
+  )
+
+  const deleteDocument = useCallback(
+    async (doc) => {
+      try {
+        await apiFetch(`${apiBase}/documents/${doc.id}/`, { method: 'DELETE', timeout: UPLOAD_TIMEOUT_MS })
+        setDocuments((previous) => previous.filter((entry) => entry.id !== doc.id))
+        notify(`« ${doc.name} » supprimé`)
+      } catch (error) {
+        notify(`Suppression impossible : ${error.message}`, 'error')
+      }
+    },
+    [apiBase, notify]
   )
 
   const openFilePicker = () => fileInputRef.current?.click()
 
-  const handleDeleteDocument = useCallback(
-    async (id) => {
-      if (!id) return
-      try {
-        await apiFetch(`${apiBase}/documents/${id}/`, { method: 'DELETE', timeout: UPLOAD_TIMEOUT_MS })
-        setDocuments((previous) => previous.filter((doc) => doc.id !== id))
-        showStatus('Document supprimé.', 'success')
-      } catch (error) {
-        console.error('Erreur de suppression', error)
-        showStatus(`Impossible de supprimer le document : ${error.message}`, 'error')
-      }
-    },
-    [apiBase]
-  )
-
-  const resetConversation = () => {
-    setMessages([createWelcomeMessage()])
-    setStatusMessage(null)
+  const newConversation = () => {
+    setMessages([])
+    setIsSidebarOpen(false)
+    composerRef.current?.focus()
   }
 
-  const isConversationEmpty = messages.length === 1
-  const canSend = serverState === 'online' && !isLoading
+  // Drag & drop anywhere on the page
+  const dragHandlers = {
+    onDragEnter: (event) => {
+      if (!event.dataTransfer?.types?.includes('Files')) return
+      dragDepth.current += 1
+      setIsDragging(true)
+    },
+    onDragLeave: () => {
+      dragDepth.current = Math.max(0, dragDepth.current - 1)
+      if (dragDepth.current === 0) setIsDragging(false)
+    },
+    onDragOver: (event) => event.preventDefault(),
+    onDrop: (event) => {
+      event.preventDefault()
+      dragDepth.current = 0
+      setIsDragging(false)
+      uploadDocuments(event.dataTransfer.files)
+    },
+  }
+
+  const isEmpty = messages.length === 0
 
   return (
-    <div className={`app-shell ${isPanelOpen ? 'panel-open' : ''}`}>
+    <div className={`app ${isSidebarOpen ? 'sidebar-open' : ''}`} {...dragHandlers}>
       <input
         ref={fileInputRef}
         type="file"
-        className="document-input"
+        hidden
         multiple
         accept={ACCEPTED_FILE_TYPES}
         onChange={(event) => {
-          handleUploadDocuments(event.target.files)
+          uploadDocuments(event.target.files)
           event.target.value = ''
         }}
       />
 
-      <DocumentPanel
+      <Sidebar
         documents={documents}
-        isRagEnabled={isRagEnabled}
+        serverState={serverState}
         isUploading={isUploading}
-        canUpload={serverState === 'online'}
+        theme={theme}
+        onToggleTheme={toggleTheme}
+        onNewConversation={newConversation}
         onUpload={openFilePicker}
-        onDelete={handleDeleteDocument}
-        onClose={() => setIsPanelOpen(false)}
+        onDelete={deleteDocument}
+        onRetryServer={wakeServer}
+        onClose={() => setIsSidebarOpen(false)}
       />
-      {isPanelOpen && <div className="panel-backdrop" onClick={() => setIsPanelOpen(false)} />}
+      <div className="sidebar-backdrop" onClick={() => setIsSidebarOpen(false)} aria-hidden="true" />
 
-      <main className="chat-surface">
-        <header className="chat-header">
-          <div className="chat-brand">
-            <div className="chat-brand-icon">
-              <SparklesIcon aria-hidden="true" />
-            </div>
-            <div className="chat-brand-text">
-              <h1>Assistant IA</h1>
-              <p>Réponses augmentées par vos documents</p>
-            </div>
-          </div>
-
-          <div className="chat-header-actions">
-            <Button
-              variant="outline"
-              size="sm"
-              className="documents-toggle"
-              onClick={() => setIsPanelOpen(true)}
-              aria-label="Afficher les documents"
-            >
-              <FileTextIcon aria-hidden="true" />
-              <span>Documents</span>
-              <Badge variant="muted">{documents.length}</Badge>
-            </Button>
-            <Button
-              variant="ghost"
-              size="sm"
-              onClick={resetConversation}
-              disabled={isConversationEmpty || isLoading}
-              aria-label="Nouvelle conversation"
-              title="Nouvelle conversation"
-            >
-              <RefreshIcon aria-hidden="true" />
-            </Button>
-            <div className="rag-toggle">
-              <DatabaseIcon aria-hidden="true" />
-              <Label htmlFor="rag-switch">Mode RAG</Label>
-              <Switch id="rag-switch" checked={isRagEnabled} onCheckedChange={setIsRagEnabled} />
-            </div>
-          </div>
+      <main className="main">
+        <header className="topbar">
+          <button className="icon-button" onClick={() => setIsSidebarOpen(true)} aria-label="Ouvrir le menu">
+            <Menu size={20} />
+          </button>
+          <span className="topbar-title">Assistant RAG</span>
+          <button className="icon-button" onClick={newConversation} aria-label="Nouvelle conversation">
+            <SquarePen size={19} />
+          </button>
         </header>
 
-        <ServerStatus state={serverState} onRetry={wakeServer} />
-
-        <div className="chat-mode">
-          {isRagEnabled ? (
-            <span className="status-rag">
-              <span className="status-dot" />
-              Recherche dans vos documents — {documents.length} document
-              {documents.length > 1 ? 's' : ''} disponible{documents.length > 1 ? 's' : ''}
-            </span>
-          ) : (
-            <span className="status-standard">
-              <span className="status-dot" />
-              Mode standard — réponses du modèle, sans documents
-            </span>
-          )}
+        <div className="thread" ref={scrollRef}>
+          <div className="thread-inner">
+            {isEmpty ? (
+              <EmptyState
+                isRagEnabled={isRagEnabled}
+                documents={documents}
+                disabled={serverState !== 'online'}
+                onPick={(question) => sendMessage(question)}
+              />
+            ) : (
+              messages.map((message) => (
+                <Message key={message.id} message={message} onRetry={retry} />
+              ))
+            )}
+          </div>
         </div>
 
-        <div className="chat-messages" aria-live="polite">
-          {messages.map((message) => (
-            <ChatMessage key={message.id} message={message} onRetry={handleRetry} />
-          ))}
-
-          {isConversationEmpty && serverState === 'online' && (
-            <div className="chat-suggestions">
-              {SUGGESTIONS[isRagEnabled ? 'rag' : 'direct'].map((suggestion) => (
-                <button
-                  key={suggestion}
-                  type="button"
-                  className="chat-suggestion"
-                  onClick={() => handleSendMessage(suggestion)}
-                >
-                  {suggestion}
-                </button>
-              ))}
-            </div>
-          )}
-
-          {isLoading && !messages.at(-1)?.isStreaming && (
-            <div className="chat-loading" role="status">
-              <div className="chat-loading-icon">
-                <SparklesIcon aria-hidden="true" />
-              </div>
-              <div className="chat-loading-dots">
-                <span />
-                <span />
-                <span />
-              </div>
-              <span className="visually-hidden">L'assistant rédige une réponse…</span>
-            </div>
-          )}
-          <div ref={messagesEndRef} />
-        </div>
-
-        <footer className="chat-input">
-          <ChatInput
-            onSend={handleSendMessage}
+        <div className="composer-dock">
+          <Composer
+            ref={composerRef}
+            serverState={serverState}
+            isRagEnabled={isRagEnabled}
+            onToggleRag={setIsRagEnabled}
+            documentCount={documents.length}
+            isBusy={isLoading}
+            isUploading={isUploading}
+            onSend={sendMessage}
             onAttach={openFilePicker}
-            canSend={canSend}
-            canAttach={serverState === 'online' && !isUploading}
-            placeholder={
-              serverState === 'online'
-                ? isRagEnabled
-                  ? 'Posez une question sur vos documents…'
-                  : 'Posez votre question…'
-                : 'Connexion au serveur en cours…'
-            }
+            onRetryServer={wakeServer}
           />
-          {statusMessage && (
-            <p className={`status-message status-message-${statusMessage.tone}`} role="status">
-              {statusMessage.text}
-            </p>
-          )}
-        </footer>
+        </div>
       </main>
+
+      {isDragging && (
+        <div className="drop-overlay">
+          <div className="drop-card">
+            <p>Déposez vos fichiers</p>
+            <span>PDF, DOCX, TXT, Markdown, HTML, CSV, JSON, XML · 10 Mo max</span>
+          </div>
+        </div>
+      )}
+
+      <Toast toast={toast} onDismiss={() => setToast(null)} />
     </div>
   )
 }
