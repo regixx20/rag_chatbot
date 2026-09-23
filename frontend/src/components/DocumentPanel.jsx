@@ -1,90 +1,57 @@
-import { useRef } from 'react'
 import { Button } from './ui/Button'
 import { Card } from './ui/Card'
 import { Badge } from './ui/Badge'
 import { ScrollArea } from './ui/ScrollArea'
-import {
-  UploadIcon,
-  FileTextIcon,
-  CloseIcon,
-  FileIcon,
-  ImageIcon,
-  ArchiveIcon,
-} from './icons'
-
-function formatFileSize(bytes) {
-  if (!bytes || Number.isNaN(bytes)) return 'Taille inconnue'
-  const units = ['B', 'KB', 'MB', 'GB']
-  let size = bytes
-  let unitIndex = 0
-  while (size >= 1024 && unitIndex < units.length - 1) {
-    size /= 1024
-    unitIndex += 1
-  }
-  return `${Math.round(size * 100) / 100} ${units[unitIndex]}`
-}
+import { UploadIcon, FileTextIcon, CloseIcon, FileIcon } from './icons'
 
 function getFileIcon(type = '') {
   const normalised = type.toLowerCase()
-  if (normalised.includes('pdf') || normalised.includes('doc')) return FileTextIcon
-  if (normalised.includes('png') || normalised.includes('jpg') || normalised.includes('jpeg')) return ImageIcon
-  if (normalised.includes('zip') || normalised.includes('rar')) return ArchiveIcon
+  if (['pdf', 'docx', 'txt', 'md'].some((ext) => normalised.includes(ext))) return FileTextIcon
   return FileIcon
 }
 
-export function DocumentPanel({ documents, isRagEnabled, onUpload, onDelete }) {
-  const fileInputRef = useRef(null)
-
-  const handleChange = (event) => {
-    const files = event.target.files
-    if (files && files.length > 0) {
-      onUpload?.(files)
-      event.target.value = ''
-    }
-  }
-
+export function DocumentPanel({
+  documents,
+  isRagEnabled,
+  isUploading,
+  canUpload,
+  onUpload,
+  onDelete,
+  onClose,
+}) {
   return (
-    <aside className="document-panel">
+    <aside className="document-panel" aria-label="Documents RAG">
       <div className="document-header">
         <div>
           <h2>Documents RAG</h2>
-          <p>Ajoutez vos sources pour enrichir l'IA.</p>
+          <p>Ajoutez vos sources pour enrichir les réponses.</p>
         </div>
         <Badge variant="outline" className="document-count">
           {documents.length}
         </Badge>
+        <Button
+          variant="ghost"
+          size="sm"
+          className="document-panel-close"
+          onClick={onClose}
+          aria-label="Fermer le panneau des documents"
+        >
+          <CloseIcon />
+        </Button>
       </div>
 
-      <input
-        ref={fileInputRef}
-        type="file"
-        className="document-input"
-        onChange={handleChange}
-        multiple
-        accept=".pdf,.txt,.doc,.docx,.md,.png,.jpg,.jpeg,.zip"
-      />
-
-      {isRagEnabled ? (
-        <Button className="document-upload" onClick={() => fileInputRef.current?.click()}>
-          <UploadIcon />
-          <span>Téléverser des documents</span>
-        </Button>
-      ) : (
-        <div className="document-disabled">
-          Activez le mode RAG pour téléverser des documents.
-        </div>
-      )}
+      <Button className="document-upload" onClick={onUpload} disabled={!canUpload || isUploading}>
+        {isUploading ? <span className="spinner spinner-light" aria-hidden="true" /> : <UploadIcon />}
+        <span>{isUploading ? 'Analyse en cours…' : 'Ajouter des documents'}</span>
+      </Button>
+      <p className="document-formats">PDF, DOCX, TXT, Markdown, HTML, CSV, JSON, XML</p>
 
       <ScrollArea className="document-list">
         {documents.length === 0 ? (
           <div className="document-empty">
             <FileTextIcon />
-            <p>Aucun document ingéré</p>
-            <span>
-              {isRagEnabled
-                ? 'Ajoutez des fichiers pour enrichir les réponses.'
-                : 'Activez le mode RAG pour commencer.'}
-            </span>
+            <p>Aucun document</p>
+            <span>Ajoutez un fichier : le mode RAG s'activera automatiquement.</span>
           </div>
         ) : (
           documents.map((doc) => {
@@ -99,13 +66,9 @@ export function DocumentPanel({ documents, isRagEnabled, onUpload, onDelete }) {
                     {doc.name}
                   </p>
                   <div className="document-meta">
-                    <span>{formatFileSize(doc.size)}</span>
+                    <span>{doc.type ? doc.type.toUpperCase() : 'Fichier'}</span>
                     <span>•</span>
-                    <span>
-                      {doc.uploadedAt
-                        ? new Date(doc.uploadedAt).toLocaleDateString('fr-FR')
-                        : 'Date inconnue'}
-                    </span>
+                    <span>{new Date(doc.uploadedAt).toLocaleDateString('fr-FR')}</span>
                   </div>
                 </div>
                 <Button
@@ -123,8 +86,12 @@ export function DocumentPanel({ documents, isRagEnabled, onUpload, onDelete }) {
         )}
       </ScrollArea>
 
-      {isRagEnabled && documents.length > 0 && (
-        <div className="document-footer">Ces documents seront utilisés pour enrichir les réponses.</div>
+      {documents.length > 0 && (
+        <div className="document-footer">
+          {isRagEnabled
+            ? 'Ces documents sont utilisés pour répondre.'
+            : 'Activez le mode RAG pour utiliser ces documents.'}
+        </div>
       )}
     </aside>
   )

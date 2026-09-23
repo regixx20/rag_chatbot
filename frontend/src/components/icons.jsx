@@ -121,3 +121,24 @@ export const CloseIcon = createIcon(function CloseIcon({ className, ...props }) 
   )
 })
 
+
+export const RefreshIcon = createIcon(function RefreshIcon({ className, ...props }) {
+  return (
+    <svg {...iconProps} className={className} {...props}>
+      <path d="M3 12a9 9 0 0 1 15.5-6.2L21 8" />
+      <path d="M21 3v5h-5" />
+      <path d="M21 12a9 9 0 0 1-15.5 6.2L3 16" />
+      <path d="M3 21v-5h5" />
+    </svg>
+  )
+})
+
+export const AlertIcon = createIcon(function AlertIcon({ className, ...props }) {
+  return (
+    <svg {...iconProps} className={className} {...props}>
+      <circle cx="12" cy="12" r="9" />
+      <path d="M12 7.5v5" />
+      <path d="M12 16.5h.01" />
+    </svg>
+  )
+})

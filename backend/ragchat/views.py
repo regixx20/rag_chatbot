@@ -91,12 +91,26 @@ class DocumentViewSet(viewsets.ModelViewSet):
         return Response({"ingested_sources": ingested})
 
 
+class HealthView(APIView):
+    """Lightweight endpoint used by the frontend to wake the server up."""
+
+    def get(self, request, *args, **kwargs):
+        return Response({"status": "ok"})
+
+
 class ChatView(APIView):
     def post(self, request, *args, **kwargs):
         serializer = ChatRequestSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
 
-        engine = get_engine()
+        try:
+            engine = get_engine()
+        except RuntimeError:
+            logger.exception("Moteur de chatbot indisponible")
+            return Response(
+                {"detail": "Le serveur n'est pas configuré (clé OpenAI manquante)."},
+                status=status.HTTP_503_SERVICE_UNAVAILABLE,
+            )
         message = serializer.validated_data["message"]
         mode = serializer.validated_data["mode"]
         history = serializer.validated_data.get("history", [])
@@ -106,7 +120,14 @@ class ChatView(APIView):
             mode,
             len(history),
         )
-        answer, intent, sources = engine.chat(message, mode=mode, history=history)
+        try:
+            answer, intent, sources = engine.chat(message, mode=mode, history=history)
+        except Exception:
+            logger.exception("Échec de la génération de la réponse")
+            return Response(
+                {"detail": "Le modèle de langage n'a pas pu répondre. Réessayez dans un instant."},
+                status=status.HTTP_502_BAD_GATEWAY,
+            )
         response_serializer = ChatResponseSerializer(
             {"response": answer, "intent": intent, "used_documents": sources}
         )

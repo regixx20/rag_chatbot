@@ -44,7 +44,7 @@ class ChatbotEngine:
         self,
         docs_path: str | os.PathLike[str] = "docs",
         index_path: str | os.PathLike[str] = "faiss_index",
-        llm_name: str = os.getenv("OPENAI_CHAT_MODEL", "gpt-3.5-turbo"),
+        llm_name: str = os.getenv("OPENAI_CHAT_MODEL", "gpt-4o-mini"),
     ) -> None:
         self.docs_path = Path(docs_path)
         self.index_path = Path(index_path)
@@ -53,7 +53,10 @@ class ChatbotEngine:
         if not self.api_key:
             raise RuntimeError("OPENAI_API_KEY must be provided in the environment.")
 
-        self.model = ChatOpenAI(api_key=self.api_key, model=self.llm_name)
+        # Explicit timeout: without it a stuck OpenAI call keeps the request open for minutes
+        self.model = ChatOpenAI(
+            api_key=self.api_key, model=self.llm_name, timeout=45, max_retries=1
+        )
         self.embedding = OpenAIEmbeddings(api_key=self.api_key)
 
         self.text_splitter = RecursiveCharacterTextSplitter(
@@ -227,9 +230,8 @@ class ChatbotEngine:
         history_entries = list(history or [])
         history_text = self._render_history(history_entries)
 
-        has_documents = self._has_documents()
-
-        if not has_documents:
+        # Direct mode only needs the LLM: documents are required for RAG only
+        if normalized_mode == "rag" and not self._has_documents():
             logger.info(
                 "Aucun document n'est indexé actuellement. Réponse informative retournée."
             )
@@ -443,9 +445,6 @@ class ChatbotEngine:
 
 
 # Global singleton to avoid rebuilding the FAISS index repeatedly.
-_ENGINE: ChatbotEngine | None = None
-
-
 _ENGINE: ChatbotEngine | None = None
 _ENGINE_KEY: str | None = None
 
