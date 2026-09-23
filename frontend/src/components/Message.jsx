@@ -1,6 +1,6 @@
 import { useState } from 'react'
 import ReactMarkdown from 'react-markdown'
-import { AlertCircle, BookOpen, Check, Copy, FileText, RotateCcw, SearchX, Sparkles } from 'lucide-react'
+import { AlertCircle, BookOpen, Brain, Check, Copy, FileText, RotateCcw, SearchX } from 'lucide-react'
 import { Logo } from './Logo'
 
 const documentName = (source) => source.document.replace(/\.[a-z0-9]+$/i, '').replace(/[_-]+/g, ' ')
@@ -178,7 +178,7 @@ export function Message({ message, onRetry }) {
               )}
               {message.intent === 'Direct' && (
                 <>
-                  <Sparkles size={13} /> Connaissances générales du modèle
+                  <Brain size={13} /> Connaissances générales du modèle
                 </>
               )}
             </span>

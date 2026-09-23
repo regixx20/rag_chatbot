@@ -1,5 +1,5 @@
 import { forwardRef, useLayoutEffect, useRef, useState, useImperativeHandle } from 'react'
-import { ArrowUp, BookOpen, Loader2, Paperclip, Sparkles } from 'lucide-react'
+import { ArrowUp, BookOpen, Brain, Loader2, Paperclip } from 'lucide-react'
 
 const MAX_HEIGHT = 220
 
@@ -115,7 +115,7 @@ export const Composer = forwardRef(function Composer(
               className={!isRagEnabled ? 'is-active' : ''}
               onClick={() => onToggleRag(false)}
             >
-              <Sparkles size={14} />
+              <Brain size={14} />
               Modèle seul
             </button>
           </div>
