@@ -1,15 +1,31 @@
 """Django settings for the RAG chatbot backend."""
 from __future__ import annotations
-from dotenv import load_dotenv
-load_dotenv(override=True)
 
-from pathlib import Path
 import os
+import sys
+from pathlib import Path
+
+from corsheaders.defaults import default_headers
+from dotenv import load_dotenv
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 
+# Local secrets live in backend/.env (git-ignored); in production they are set
+# as environment variables on the host and never reach the frontend.
+load_dotenv(BASE_DIR / ".env")
+
+# On Windows, use the system certificate store: antivirus/proxies that inspect
+# HTTPS make Python's bundled certificates fail (SSL: CERTIFICATE_VERIFY_FAILED).
+if sys.platform == "win32":
+    try:
+        import truststore
+
+        truststore.inject_into_ssl()
+    except ImportError:
+        pass
+
 SECRET_KEY = os.getenv("DJANGO_SECRET_KEY", "django-insecure-rag-chatbot")
-DEBUG = os.getenv("DJANGO_DEBUG", "True") == "True"
+DEBUG = os.getenv("DJANGO_DEBUG", "False") == "True"
 ALLOWED_HOSTS: list[str] = os.getenv("DJANGO_ALLOWED_HOSTS", "*").split(",")
 
 INSTALLED_APPS = [
@@ -93,3 +109,11 @@ REST_FRAMEWORK = {
 }
 
 CORS_ALLOW_ALL_ORIGINS = True
+CORS_ALLOW_HEADERS = (*default_headers, "x-session-id")
+
+LOGGING = {
+    "version": 1,
+    "disable_existing_loggers": False,
+    "handlers": {"console": {"class": "logging.StreamHandler"}},
+    "loggers": {"ragchat": {"handlers": ["console"], "level": os.getenv("RAG_LOG_LEVEL", "INFO")}},
+}

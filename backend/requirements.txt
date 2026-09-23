@@ -1,16 +1,15 @@
 django>=4.2,<5.0
 djangorestframework>=3.14,<4.0
 django-cors-headers>=3.14,<4.0
-langchain>=0.1.0
-langchain-openai>=0.0.5
-langchain-community>=0.0.10
-langgraph>=0.0.26
+langchain-core>=0.3
+langchain-community>=0.3
+langchain-text-splitters>=0.3
 faiss-cpu
+google-genai>=2.0
+numpy
+pypdf>=4.0
+docx2txt
+beautifulsoup4
 python-dotenv>=1.0
-openai>=1.0
-tqdm>=4.66
-langchain-text-splitters
-python-dotenv
-unstructured
-langdetect
 gunicorn
+truststore; sys_platform == "win32"
