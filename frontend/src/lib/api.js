@@ -29,6 +29,30 @@ export function resolveApiBase() {
   return LOCAL_API_BASE
 }
 
+// Each visitor gets their own documents: the backend scopes them by this id
+const SESSION_STORAGE_KEY = 'rag-chatbot-session-id'
+let memorySessionId = null
+
+function createSessionId() {
+  if (typeof crypto !== 'undefined' && crypto.randomUUID) return crypto.randomUUID()
+  return `s-${Date.now()}-${Math.random().toString(16).slice(2)}`
+}
+
+export function getSessionId() {
+  try {
+    let id = localStorage.getItem(SESSION_STORAGE_KEY)
+    if (!id) {
+      id = createSessionId()
+      localStorage.setItem(SESSION_STORAGE_KEY, id)
+    }
+    return id
+  } catch {
+    // Storage blocked (private mode…): keep the id for this page only
+    memorySessionId ??= createSessionId()
+    return memorySessionId
+  }
+}
+
 export class ApiError extends Error {
   constructor(message, { status, isTimeout = false } = {}) {
     super(message)
@@ -50,14 +74,20 @@ async function readErrorDetail(response) {
   return null
 }
 
-export async function apiFetch(url, { timeout = CHAT_TIMEOUT_MS, signal, ...options } = {}) {
+// `raw: true` returns the Response as soon as headers arrive (used for streaming)
+export async function apiFetch(url, { timeout = CHAT_TIMEOUT_MS, signal, raw = false, ...options } = {}) {
   const controller = new AbortController()
   const timer = setTimeout(() => controller.abort('timeout'), timeout)
   const onAbort = () => controller.abort(signal.reason)
   signal?.addEventListener('abort', onAbort)
 
   try {
-    const response = await fetch(url, { ...options, signal: controller.signal })
+    const response = await fetch(url, {
+      ...options,
+      headers: { 'X-Session-Id': getSessionId(), ...options.headers },
+      signal: controller.signal,
+    })
+    if (raw) return response
     if (!response.ok) {
       const detail = await readErrorDetail(response)
       throw new ApiError(detail || `Le serveur a répondu avec une erreur (${response.status}).`, {
@@ -76,4 +106,54 @@ export async function apiFetch(url, { timeout = CHAT_TIMEOUT_MS, signal, ...opti
     clearTimeout(timer)
     signal?.removeEventListener('abort', onAbort)
   }
+}
+
+/**
+ * Streams an answer from /chat/stream/ (NDJSON). Calls onMeta once with intent and
+ * sources, then onToken for each piece of text. Falls back to /chat/ on older backends.
+ */
+export async function streamChat(apiBase, payload, { onMeta, onToken }) {
+  const request = {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+    timeout: CHAT_TIMEOUT_MS,
+  }
+
+  const response = await apiFetch(`${apiBase}/chat/stream/`, { ...request, raw: true })
+
+  if (response.status === 404) {
+    const data = await apiFetch(`${apiBase}/chat/`, request)
+    onMeta({ intent: data?.intent || 'Direct', sources: data?.sources ?? [] })
+    onToken(data?.response || '')
+    return
+  }
+  if (!response.ok) {
+    const detail = await readErrorDetail(response)
+    throw new ApiError(detail || `Le serveur a répondu avec une erreur (${response.status}).`, {
+      status: response.status,
+    })
+  }
+
+  const reader = response.body.getReader()
+  const decoder = new TextDecoder()
+  let buffer = ''
+
+  const handleLine = (line) => {
+    if (!line.trim()) return
+    const event = JSON.parse(line)
+    if (event.type === 'meta') onMeta(event)
+    else if (event.type === 'token') onToken(event.content)
+    else if (event.type === 'error') throw new ApiError(event.detail, { status: 502 })
+  }
+
+  for (;;) {
+    const { done, value } = await reader.read()
+    if (done) break
+    buffer += decoder.decode(value, { stream: true })
+    const lines = buffer.split('\n')
+    buffer = lines.pop()
+    lines.forEach(handleLine)
+  }
+  handleLine(buffer + decoder.decode())
 }

@@ -1,463 +1,443 @@
-"""Core chatbot logic shared by API endpoints."""
+"""Core RAG pipeline shared by the API endpoints and the CLI.
+
+Knowledge is split in two kinds of FAISS indexes stored on disk:
+- a read-only "demo" index built from the files in ``demo_docs/`` (always available,
+  rebuilt automatically when the files or the embedding model change);
+- one index per visitor session, holding the documents that visitor uploaded.
+
+A question is answered in four steps: condense it with the conversation history,
+retrieve the most relevant chunks from both indexes, drop the ones under a relevance
+threshold, then ask the LLM to answer from those numbered extracts only.
+"""
 from __future__ import annotations
 
-
+import csv
+import hashlib
+import json
 import logging
 import os
 import shutil
+import threading
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable, List
+from typing import Iterable, Iterator
 
-
-
+from langchain_community.document_loaders import Docx2txtLoader, PyPDFLoader
 from langchain_community.vectorstores import FAISS
-from langchain_community.document_loaders import (
-    CSVLoader,
-    Docx2txtLoader,
-    JSONLoader,
-    PyPDFLoader,
-    TextLoader,
-    UnstructuredHTMLLoader,
-    UnstructuredMarkdownLoader,
-    UnstructuredXMLLoader,
-)
-
-from langchain_text_splitters import RecursiveCharacterTextSplitter
-
 from langchain_core.documents import Document
-from langchain_core.messages import AIMessage
+from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage
 from langchain_openai import ChatOpenAI, OpenAIEmbeddings
-
-from langdetect import DetectorFactory, LangDetectException, detect
-
-
+from langchain_text_splitters import RecursiveCharacterTextSplitter
 
 logger = logging.getLogger(__name__)
 
-DetectorFactory.seed = 0
+BACKEND_DIR = Path(__file__).resolve().parent.parent
+DEMO_DOCS_DIR = Path(os.getenv("RAG_DEMO_DOCS_DIR", BACKEND_DIR / "demo_docs"))
+DATA_DIR = Path(os.getenv("RAG_DATA_DIR", BACKEND_DIR / "rag_data"))
+
+CHAT_MODEL = os.getenv("OPENAI_CHAT_MODEL", "gpt-4o-mini")
+EMBEDDING_MODEL = os.getenv("OPENAI_EMBEDDING_MODEL", "text-embedding-3-small")
+TOP_K = int(os.getenv("RAG_TOP_K", "4"))
+# Cosine similarity between the question and a chunk (1 = identical meaning).
+# Chunks below this score are ignored instead of being fed to the LLM.
+MIN_RELEVANCE = float(os.getenv("RAG_MIN_RELEVANCE", "0.3"))
+HISTORY_MESSAGES = int(os.getenv("RAG_HISTORY_MESSAGES", "8"))
+HISTORY_CHARS = 1500
+
+SUPPORTED_EXTENSIONS = {".pdf", ".docx", ".txt", ".md", ".html", ".htm", ".xml", ".json", ".csv"}
+DEMO_INDEX = "demo"
 
 
+@dataclass
+class Source:
+    """A retrieved chunk, as shown to the user."""
+
+    number: int
+    document: str
+    page: int | None
+    excerpt: str
+    score: float
+    is_demo: bool
+
+    def as_dict(self) -> dict:
+        return {
+            "number": self.number,
+            "document": self.document,
+            "page": self.page,
+            "excerpt": self.excerpt,
+            "score": round(self.score, 3),
+            "is_demo": self.is_demo,
+        }
+
+
+@dataclass
+class PreparedAnswer:
+    """Everything needed to call the LLM, computed before the (possibly streamed) call."""
+
+    messages: list[BaseMessage]
+    intent: str
+    sources: list[Source]
+    standalone_question: str
+
+
+# ----------------------------------------------------------------------
+# File loading
+# ----------------------------------------------------------------------
+def _read_text(path: Path) -> str:
+    raw = path.read_bytes()
+    for encoding in ("utf-8", "utf-8-sig", "cp1252", "latin-1"):
+        try:
+            return raw.decode(encoding)
+        except UnicodeDecodeError:
+            continue
+    return raw.decode("utf-8", errors="ignore")
+
+
+def _html_to_text(markup: str) -> str:
+    from bs4 import BeautifulSoup
+
+    soup = BeautifulSoup(markup, "html.parser")
+    for tag in soup(["script", "style", "noscript"]):
+        tag.decompose()
+    return soup.get_text("\n", strip=True)
+
+
+def load_file(path: Path, display_name: str | None = None) -> list[Document]:
+    """Extract the text of a file. PDF pages keep their page number in metadata."""
+
+    name = display_name or path.name
+    suffix = path.suffix.lower()
+
+    if suffix == ".pdf":
+        documents = PyPDFLoader(str(path)).load()
+        for doc in documents:
+            doc.metadata = {"page": int(doc.metadata.get("page", 0)) + 1}
+    elif suffix == ".docx":
+        documents = Docx2txtLoader(str(path)).load()
+    elif suffix in {".html", ".htm"}:
+        documents = [Document(page_content=_html_to_text(_read_text(path)))]
+    elif suffix == ".json":
+        content = json.loads(_read_text(path))
+        documents = [Document(page_content=json.dumps(content, ensure_ascii=False, indent=2))]
+    elif suffix == ".csv":
+        rows = csv.DictReader(_read_text(path).splitlines())
+        lines = [", ".join(f"{key}: {value}" for key, value in row.items()) for row in rows]
+        documents = [Document(page_content="\n".join(lines))]
+    elif suffix in {".txt", ".md", ".xml"}:
+        documents = [Document(page_content=_read_text(path))]
+    else:
+        raise ValueError(f"Format non pris en charge : {suffix}")
+
+    documents = [doc for doc in documents if doc.page_content.strip()]
+    for doc in documents:
+        doc.metadata["source"] = name
+    return documents
+
+
+# ----------------------------------------------------------------------
+# On-disk FAISS indexes
+# ----------------------------------------------------------------------
+class IndexStore:
+    """FAISS indexes persisted on disk, cached in memory and reloaded when changed on disk
+    (several gunicorn workers may write to the same index)."""
+
+    def __init__(self, root: Path, embeddings: OpenAIEmbeddings) -> None:
+        self.root = root
+        self.embeddings = embeddings
+        self._cache: dict[str, tuple[float, FAISS]] = {}
+        self._lock = threading.RLock()
+
+    def _dir(self, key: str) -> Path:
+        return self.root / key
+
+    def _mtime(self, key: str) -> float | None:
+        index_file = self._dir(key) / "index.faiss"
+        return index_file.stat().st_mtime if index_file.exists() else None
+
+    def get(self, key: str) -> FAISS | None:
+        with self._lock:
+            mtime = self._mtime(key)
+            if mtime is None:
+                self._cache.pop(key, None)
+                return None
+            cached = self._cache.get(key)
+            if cached and cached[0] == mtime:
+                return cached[1]
+            store = FAISS.load_local(
+                str(self._dir(key)), self.embeddings, allow_dangerous_deserialization=True
+            )
+            self._cache[key] = (mtime, store)
+            return store
+
+    def _save(self, key: str, store: FAISS) -> None:
+        directory = self._dir(key)
+        directory.mkdir(parents=True, exist_ok=True)
+        store.save_local(str(directory))
+        self._cache[key] = (self._mtime(key) or 0.0, store)
+
+    def add(self, key: str, chunks: list[Document], ids: list[str]) -> None:
+        with self._lock:
+            store = self.get(key)
+            if store is None:
+                store = FAISS.from_documents(chunks, self.embeddings, ids=ids)
+            else:
+                store.add_documents(chunks, ids=ids)
+            self._save(key, store)
+
+    def delete(self, key: str, ids: list[str]) -> None:
+        """Remove chunks without re-embedding anything."""
+        with self._lock:
+            store = self.get(key)
+            if store is None:
+                return
+            existing = [chunk_id for chunk_id in ids if chunk_id in store.index_to_docstore_id.values()]
+            if existing:
+                store.delete(existing)
+            if store.index.ntotal == 0:
+                self.drop(key)
+            else:
+                self._save(key, store)
+
+    def drop(self, key: str) -> None:
+        with self._lock:
+            self._cache.pop(key, None)
+            shutil.rmtree(self._dir(key), ignore_errors=True)
+
+    def read_meta(self, key: str) -> str | None:
+        meta = self._dir(key) / "fingerprint.txt"
+        return meta.read_text(encoding="utf-8") if meta.exists() else None
+
+    def write_meta(self, key: str, value: str) -> None:
+        self._dir(key).mkdir(parents=True, exist_ok=True)
+        (self._dir(key) / "fingerprint.txt").write_text(value, encoding="utf-8")
+
+
+# ----------------------------------------------------------------------
+# Engine
+# ----------------------------------------------------------------------
 class ChatbotEngine:
-    """Encapsulates the RAG pipeline and exposes chat/upload helpers."""
-
-    def __init__(
-        self,
-        docs_path: str | os.PathLike[str] = "docs",
-        index_path: str | os.PathLike[str] = "faiss_index",
-        llm_name: str = os.getenv("OPENAI_CHAT_MODEL", "gpt-4o-mini"),
-    ) -> None:
-        self.docs_path = Path(docs_path)
-        self.index_path = Path(index_path)
-        self.llm_name = llm_name
-        self.api_key = os.getenv("OPENAI_API_KEY")
-        if not self.api_key:
+    def __init__(self) -> None:
+        api_key = os.getenv("OPENAI_API_KEY")
+        if not api_key:
             raise RuntimeError("OPENAI_API_KEY must be provided in the environment.")
 
         # Explicit timeout: without it a stuck OpenAI call keeps the request open for minutes
-        self.model = ChatOpenAI(
-            api_key=self.api_key, model=self.llm_name, timeout=45, max_retries=1
+        self.model = ChatOpenAI(api_key=api_key, model=CHAT_MODEL, timeout=45, max_retries=1)
+        self.condense_model = ChatOpenAI(
+            api_key=api_key, model=CHAT_MODEL, timeout=20, max_retries=1, temperature=0
         )
-        self.embedding = OpenAIEmbeddings(api_key=self.api_key)
+        self.embeddings = OpenAIEmbeddings(api_key=api_key, model=EMBEDDING_MODEL)
+        self.splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=150)
+        self.indexes = IndexStore(DATA_DIR / "indexes", self.embeddings)
+        self._demo_lock = threading.Lock()
+        logger.info("Moteur RAG prêt (chat=%s, embeddings=%s)", CHAT_MODEL, EMBEDDING_MODEL)
 
-        self.text_splitter = RecursiveCharacterTextSplitter(
-            chunk_size=1000, chunk_overlap=200
-        )
-
-        self._vector_store: FAISS | None = None
-        logger.info(
-            "Initialisation du moteur de chatbot avec les dossiers docs=%s, index=%s et modèle=%s",
-            self.docs_path,
-            self.index_path,
-            self.llm_name,
-        )
-        self._load_or_create_index()
-
-        self._language_names = {
-            "ar": "arabe",
-            "de": "allemand",
-            "en": "anglais",
-            "es": "espagnol",
-            "fr": "français",
-            "hi": "hindi",
-            "it": "italien",
-            "ja": "japonais",
-            "ko": "coréen",
-            "nl": "néerlandais",
-            "pl": "polonais",
-            "pt": "portugais",
-            "ru": "russe",
-            "sv": "suédois",
-            "tr": "turc",
-            "zh-cn": "chinois simplifié",
-            "zh-tw": "chinois traditionnel",
-        }
-
-    # ------------------------------------------------------------------
-    # Index bootstrap helpers
-    # ------------------------------------------------------------------
-    def _load_or_create_index(self) -> None:
-        if self.index_path.exists():
-            logger.info("Chargement de l'index FAISS existant depuis %s", self.index_path)
-            self._vector_store = FAISS.load_local(
-                str(self.index_path),
-                self.embedding,
-                allow_dangerous_deserialization=True,
-            )
-        else:
-            logger.info(
-                "Aucun index existant trouvé. Chargement des documents pour créer un nouvel index."
-            )
-            documents = self._load_all_documents(self.docs_path)
-            if documents:
-                split_docs = self.text_splitter.split_documents(documents)
-                self._vector_store = FAISS.from_documents(split_docs, self.embedding)
-                self.index_path.mkdir(parents=True, exist_ok=True)
-                self._vector_store.save_local(str(self.index_path))
-                logger.info(
-                    "Index FAISS initialisé avec %s documents et sauvegardé dans %s",
-                    len(split_docs),
-                    self.index_path,
-                )
-            else:
-                self._vector_store = None
-
-    # ------------------------------------------------------------------
-    # Document ingestion
-    # ------------------------------------------------------------------
-    def ingest_files(self, paths: Iterable[Path]) -> List[str]:
-        """Load files from disk, update the FAISS index and return their sources."""
-
-        loaded_documents: list[Document] = []
-        ingested_sources: set[str] = set()
-        for path in paths:
-            logger.info("Ingestion du fichier %s", path)
-            documents = self._load_documents_from_path(path)
-            if not documents:
-                logger.warning("Aucun document chargé depuis %s", path)
-                continue
-            split_docs = self.text_splitter.split_documents(documents)
-            loaded_documents.extend(split_docs)
-            ingested_sources.update(
-                {doc.metadata.get("source", str(path)) for doc in documents}
-            )
-
-        if not loaded_documents:
-            logger.warning("Aucun document ingéré. L'index n'a pas été mis à jour.")
+    # -- Demo corpus ----------------------------------------------------
+    def demo_files(self) -> list[Path]:
+        if not DEMO_DOCS_DIR.exists():
             return []
-
-        if self._vector_store is None:
-            self._vector_store = FAISS.from_documents(loaded_documents, self.embedding)
-            logger.info(
-                "Création d'un nouvel index FAISS avec %s fragments de documents", len(loaded_documents)
-            )
-        else:
-            self._vector_store.add_documents(loaded_documents)
-            logger.info(
-                "Ajout de %s fragments de documents à l'index FAISS existant",
-                len(loaded_documents),
-            )
-
-        self.index_path.mkdir(parents=True, exist_ok=True)
-        self._vector_store.save_local(str(self.index_path))
-        logger.info(
-            "Index FAISS sauvegardé dans %s. Sources ingérées : %s",
-            self.index_path,
-            sorted(ingested_sources),
-        )
-        return sorted(ingested_sources)
-
-    def rebuild_index(self, extra_paths: Iterable[Path] | None = None) -> None:
-        """Rebuild the FAISS index from scratch using all known documents."""
-
-        logger.info("Reconstruction complète de l'index FAISS demandée")
-        documents = self._load_all_documents(self.docs_path)
-        for path in extra_paths or []:
-            documents.extend(self._load_documents_from_path(path))
-
-        if not documents:
-            logger.info(
-                "Aucun document disponible. L'index FAISS sera supprimé et désactivé."
-            )
-            self._vector_store = None
-            if self.index_path.exists():
-                shutil.rmtree(self.index_path)
-            return
-
-        split_docs = self.text_splitter.split_documents(documents)
-        self._vector_store = FAISS.from_documents(split_docs, self.embedding)
-        self.index_path.mkdir(parents=True, exist_ok=True)
-        self._vector_store.save_local(str(self.index_path))
-        logger.info(
-            "Index FAISS reconstruit avec %s fragments de documents", len(split_docs)
+        return sorted(
+            path
+            for path in DEMO_DOCS_DIR.iterdir()
+            if path.is_file() and path.suffix.lower() in SUPPORTED_EXTENSIONS
         )
 
-    # ------------------------------------------------------------------
-    # Chat interaction
-    # ------------------------------------------------------------------
-    def _has_documents(self) -> bool:
-        """Return True when the FAISS store currently tracks at least one chunk."""
+    def _demo_fingerprint(self) -> str:
+        digest = hashlib.sha256(EMBEDDING_MODEL.encode())
+        for path in self.demo_files():
+            digest.update(path.name.encode())
+            digest.update(path.read_bytes())
+        return digest.hexdigest()
 
-        if self._vector_store is None:
-            return False
-        index = getattr(self._vector_store, "index", None)
-        if index is None:
-            return False
-        total = getattr(index, "ntotal", None)
-        if total is None:
-            return True
+    def ensure_demo_index(self) -> None:
+        """(Re)build the demo index when missing or outdated. Cheap no-op otherwise."""
+        with self._demo_lock:
+            fingerprint = self._demo_fingerprint()
+            if self.indexes.read_meta(DEMO_INDEX) == fingerprint and self.indexes.get(DEMO_INDEX):
+                return
+            self.indexes.drop(DEMO_INDEX)
+            chunks: list[Document] = []
+            for path in self.demo_files():
+                chunks.extend(self.splitter.split_documents(load_file(path)))
+            if chunks:
+                for chunk in chunks:
+                    chunk.metadata["is_demo"] = True
+                ids = [f"demo:{i}" for i in range(len(chunks))]
+                self.indexes.add(DEMO_INDEX, chunks, ids)
+                self.indexes.write_meta(DEMO_INDEX, fingerprint)
+            logger.info("Index de démo construit : %s fragments", len(chunks))
+
+    # -- Session documents ----------------------------------------------
+    @staticmethod
+    def session_key(session_id: str) -> str:
+        return f"session-{session_id}"
+
+    def ingest(self, session_id: str, document_id: int, path: Path, display_name: str) -> int:
+        """Index a visitor's file. Returns the number of chunks (0 if no text was found)."""
+        chunks = self.splitter.split_documents(load_file(path, display_name))
+        if not chunks:
+            return 0
+        for chunk in chunks:
+            chunk.metadata["document_id"] = document_id
+        ids = [f"{document_id}:{i}" for i in range(len(chunks))]
+        self.indexes.add(self.session_key(session_id), chunks, ids)
+        logger.info("Document %s indexé (%s fragments)", display_name, len(chunks))
+        return len(chunks)
+
+    def remove(self, session_id: str, document_id: int, chunk_count: int) -> None:
+        ids = [f"{document_id}:{i}" for i in range(chunk_count)]
+        self.indexes.delete(self.session_key(session_id), ids)
+
+    def drop_session(self, session_id: str) -> None:
+        self.indexes.drop(self.session_key(session_id))
+
+    # -- Retrieval --------------------------------------------------------
+    def retrieve(self, session_id: str, query: str) -> list[Source]:
+        self.ensure_demo_index()
+        candidates: list[tuple[Document, float]] = []
+        for key in (self.session_key(session_id), DEMO_INDEX):
+            store = self.indexes.get(key)
+            if store is not None:
+                # FAISS returns squared L2 distances; OpenAI embeddings are unit vectors,
+                # so cosine similarity = 1 - d² / 2
+                candidates.extend(
+                    (doc, 1 - float(distance) / 2)
+                    for doc, distance in store.similarity_search_with_score(query, k=TOP_K)
+                )
+
+        relevant = sorted(
+            (item for item in candidates if item[1] >= MIN_RELEVANCE),
+            key=lambda item: item[1],
+            reverse=True,
+        )[:TOP_K]
+        logger.info(
+            "Recherche '%s' : %s candidats, %s retenus (scores %s)",
+            query,
+            len(candidates),
+            len(relevant),
+            [round(score, 2) for _, score in relevant],
+        )
+        return [
+            Source(
+                number=i + 1,
+                document=doc.metadata.get("source", "Document"),
+                page=doc.metadata.get("page"),
+                excerpt=doc.page_content.strip(),
+                score=score,
+                is_demo=bool(doc.metadata.get("is_demo")),
+            )
+            for i, (doc, score) in enumerate(relevant)
+        ]
+
+    # -- Prompting ------------------------------------------------------------
+    @staticmethod
+    def _history_messages(history: Iterable[dict[str, str]]) -> list[BaseMessage]:
+        messages: list[BaseMessage] = []
+        for entry in list(history)[-HISTORY_MESSAGES:]:
+            content = (entry.get("content") or "").strip()[:HISTORY_CHARS]
+            if not content:
+                continue
+            role = entry.get("role")
+            messages.append(HumanMessage(content) if role == "user" else AIMessage(content))
+        return messages
+
+    def condense_question(self, message: str, history: list[BaseMessage]) -> str:
+        """Rewrite a follow-up question ("and for minors?") into a self-contained one,
+        so the vector search gets the full intent."""
+        if not history:
+            return message
+        transcript = "\n".join(
+            f"{'Utilisateur' if isinstance(m, HumanMessage) else 'Assistant'} : {m.content}"
+            for m in history[-4:]
+        )
+        prompt = [
+            SystemMessage(
+                "Reformule la dernière question de l'utilisateur en une question autonome, "
+                "compréhensible sans l'historique, dans la même langue. "
+                "Réponds uniquement par la question reformulée."
+            ),
+            HumanMessage(f"Historique :\n{transcript}\n\nDernière question : {message}"),
+        ]
         try:
-            return int(total) > 0
-        except (TypeError, ValueError):
-            return False
+            rewritten = str(self.condense_model.invoke(prompt).content).strip()
+            logger.info("Question reformulée : %s -> %s", message, rewritten)
+            return rewritten or message
+        except Exception:
+            logger.exception("Échec de la reformulation, question d'origine utilisée")
+            return message
 
-    def chat(
+    def prepare(
         self,
         message: str,
         mode: str = "rag",
         history: Iterable[dict[str, str]] | None = None,
-    ) -> tuple[str, str, list[str]]:
-        """Return the assistant answer, selected mode and supporting documents."""
-
-        logger.info("Réception d'un message utilisateur : %s", message)
-
-        detected_language = self._detect_language(message)
-        language_instruction = self._build_language_instruction(detected_language)
-
-        normalized_mode = mode.lower()
-        if normalized_mode not in {"rag", "direct"}:
+        session_id: str = "cli",
+    ) -> PreparedAnswer:
+        mode = mode.lower()
+        if mode not in {"rag", "direct"}:
             raise ValueError(f"Mode de chat invalide : {mode}")
 
-        history_entries = list(history or [])
-        history_text = self._render_history(history_entries)
+        history_messages = self._history_messages(history or [])
+        language_rule = "Réponds toujours dans la langue de la question de l'utilisateur."
 
-        # Direct mode only needs the LLM: documents are required for RAG only
-        if normalized_mode == "rag" and not self._has_documents():
-            logger.info(
-                "Aucun document n'est indexé actuellement. Réponse informative retournée."
+        if mode == "direct":
+            system = SystemMessage(
+                "Tu es un assistant utile, précis et concis. Utilise le Markdown si cela "
+                f"améliore la lisibilité. {language_rule}"
             )
-            warning = (
-                "Aucun document n'est disponible pour répondre à cette question. "
-                "Téléversez un fichier dans le panneau 'Documents RAG' et activez le "
-                "mode RAG pour obtenir une réponse contextuelle."
+            return PreparedAnswer(
+                [system, *history_messages, HumanMessage(message)], "Direct", [], message
             )
-            return warning, "NoDocuments", []
 
-        retrieved_docs: list[Document] = []
-        if normalized_mode == "rag" and self._vector_store is not None:
-            retriever = self._vector_store.as_retriever()
-            retrieved_docs = retriever.invoke(message)
+        standalone = self.condense_question(message, history_messages)
+        sources = self.retrieve(session_id, standalone)
 
-        logger.info(
-            "Documents récupérés : %s",
-            [doc.metadata.get("source", "Unknown source") for doc in retrieved_docs],
-        )
-
-        used_sources = [doc.metadata.get("source", "Unknown source") for doc in retrieved_docs]
-
-        if normalized_mode == "rag":
-            context = "\n\n".join(doc.page_content for doc in retrieved_docs)
-            if not context.strip():
-                logger.info(
-                    "Aucun contexte disponible pour le mode RAG. Réponse informative envoyée.")
-                response = self._call_no_context_response(
-                    message, history_text, language_instruction
-                )
-                return response.content, "Rag", used_sources
-
-            response = self._call_rag_response(
-                message, context, history_text, language_instruction
+        if not sources:
+            system = SystemMessage(
+                "Aucun passage pertinent n'a été trouvé dans les documents de l'utilisateur "
+                "pour cette question. Explique-le brièvement et poliment, sans inventer de "
+                "réponse, et suggère d'ajouter un document qui contient l'information ou de "
+                f"désactiver le mode RAG pour une réponse générale. {language_rule}"
             )
-            logger.info("Réponse générée (RAG) : %s", response.content)
-            logger.info("Sources utilisées : %s", used_sources)
-            return response.content, "Rag", used_sources
+            return PreparedAnswer([system, HumanMessage(message)], "NoContext", [], standalone)
 
-        response = self._call_direct_response(message, history_text, language_instruction)
-        logger.info("Réponse générée (direct) : %s", response.content)
-        return response.content, "Direct", []
-
-    # ------------------------------------------------------------------
-    # Prompt helpers
-    # ------------------------------------------------------------------
-    def _render_history(self, history: Iterable[dict[str, str]]) -> str:
-        lines: list[str] = []
-        for entry in history:
-            role = entry.get("role", "user")
-            content = entry.get("content", "").strip()
-            if not content:
-                continue
-            speaker = "Utilisateur" if role == "user" else "Assistant"
-            lines.append(f"{speaker} : {content}")
-        return "\n".join(lines)
-
-    def _call_rag_response(
-        self,
-        message: str,
-        context: str,
-        history_text: str,
-        language_instruction: str,
-    ) -> AIMessage:
-        conversation_block = (
-            f"Historique de la conversation :\n{history_text}\n\n"
-            if history_text
-            else ""
+        extracts = "\n\n".join(
+            f"[{s.number}] {s.document}{f', page {s.page}' if s.page else ''}\n{s.excerpt}"
+            for s in sources
         )
-        prompt = (
-            f"{conversation_block}"
-            "Voici des extraits de documents :\n"
-            f"{context}\n\n"
-            "En te basant uniquement sur ces extraits, réponds à la question suivante :\n"
-            f"{message}\n\n"
-            "Si les documents ne contiennent pas l'information demandée, dis-le explicitement"
-            " sans inventer de réponse.\n"
-            f"{language_instruction}"
+        system = SystemMessage(
+            "Tu réponds à partir des extraits de documents fournis ci-dessous, et uniquement "
+            "à partir d'eux. Cite tes sources avec leur numéro entre crochets, par exemple [1]. "
+            "Si les extraits ne permettent pas de répondre, dis-le clairement au lieu "
+            f"d'inventer. Utilise le Markdown si utile. {language_rule}\n\n"
+            f"Extraits :\n{extracts}"
         )
-        logger.info("Envoi au LLM (RAG) avec le prompt : %s", prompt)
-        response = self.model.invoke(prompt)
-        logger.info("Réponse du LLM (RAG) : %s", response.content)
-        return response
-
-    def _call_direct_response(
-        self, message: str, history_text: str, language_instruction: str
-    ) -> AIMessage:
-        conversation_block = (
-            f"Historique de la conversation :\n{history_text}\n\n"
-            if history_text
-            else ""
-        )
-        prompt = (
-            f"{conversation_block}"
-            "Dernière question de l'utilisateur :\n"
-            f"{message}\n\n"
-            "Réponds de manière utile et concise.\n"
-            f"{language_instruction}"
-        )
-        logger.info("Envoi au LLM (direct) du message : %s", prompt)
-        response = self.model.invoke(prompt)
-        logger.info("Réponse du LLM (direct) : %s", response.content)
-        return response
-
-    def _call_no_context_response(
-        self, message: str, history_text: str, language_instruction: str
-    ) -> AIMessage:
-        prompt = (
-            "Tu n'as trouvé aucune information pertinente dans les documents fournis.\n"
-            "Explique cette situation à l'utilisateur de manière polie et suggère d'ajouter"
-            " des documents contenant la réponse recherchée.\n"
-            f"Question de l'utilisateur : {message}\n"
-            f"Historique disponible : {history_text if history_text else 'Aucun'}\n\n"
-            f"{language_instruction}"
-        )
-        logger.info("Envoi au LLM (RAG - pas de contexte) du message : %s", prompt)
-        response = self.model.invoke(prompt)
-        logger.info("Réponse du LLM (RAG - pas de contexte) : %s", response.content)
-        return response
-
-    def _detect_language(self, message: str) -> str:
-        cleaned_message = message.strip()
-        if not cleaned_message:
-            return "en"
-        try:
-            detected = detect(cleaned_message)
-            logger.debug("Langue détectée : %s", detected)
-            return detected
-        except LangDetectException:
-            logger.warning(
-                "Impossible de détecter la langue du message. Utilisation de l'anglais par défaut."
-            )
-            return "en"
-
-    def _build_language_instruction(self, language_code: str) -> str:
-        language_name = self._language_names.get(language_code.lower(), language_code)
-        if language_name == language_code:
-            return (
-                "Réponds dans la langue associée au code ISO "
-                f"'{language_code}' détecté pour la question de l'utilisateur."
-            )
-        return (
-            f"Réponds en {language_name} (code ISO détecté : {language_code})."
+        return PreparedAnswer(
+            [system, *history_messages, HumanMessage(message)], "Rag", sources, standalone
         )
 
-    # ------------------------------------------------------------------
-    # File loader helpers
-    # ------------------------------------------------------------------
-    def _load_all_documents(self, folder_path: Path) -> list[Document]:
-        documents: list[Document] = []
-        if not folder_path.exists():
-            return documents
-        for file in folder_path.iterdir():
-            if file.is_file():
-                documents.extend(self._load_documents_from_path(file))
-        return documents
+    # -- Answering --------------------------------------------------------------
+    def answer(self, prepared: PreparedAnswer) -> str:
+        return str(self.model.invoke(prepared.messages).content)
 
-    def _load_documents_from_path(self, path: Path) -> list[Document]:
-        loader: (
-            CSVLoader
-            | Docx2txtLoader
-            | JSONLoader
-            | PyPDFLoader
-            | TextLoader
-            | UnstructuredHTMLLoader
-            | UnstructuredMarkdownLoader
-            | UnstructuredXMLLoader
-        )
-        documents: list[Document] = []
-        if not path.exists():
-            return documents
-        try:
-            suffix = path.suffix.lower()
-            if suffix == ".pdf":
-                loader = PyPDFLoader(str(path))
-                documents = loader.load()
-            elif suffix == ".txt":
-                loader = TextLoader(str(path))
-                documents = loader.load()
-            elif suffix == ".docx":
-                loader = Docx2txtLoader(str(path))
-                documents = loader.load()
-            elif suffix == ".md":
-                try:
-                    loader = UnstructuredMarkdownLoader(str(path))
-                    documents = loader.load()
-                except Exception:
-                    loader = TextLoader(str(path))
-                    documents = loader.load()
-            elif suffix in {".html", ".htm"}:
-                loader = UnstructuredHTMLLoader(str(path))
-                documents = loader.load()
-            elif suffix == ".xml":
-                loader = UnstructuredXMLLoader(str(path))
-                documents = loader.load()
-            elif suffix == ".json":
-                loader = JSONLoader(str(path), jq_schema=".", text_content=False)
-                documents = loader.load()
-                for doc in documents:
-                    doc.page_content = str(doc.page_content)
-            elif suffix == ".csv":
-                loader = CSVLoader(file_path=str(path))
-                documents = loader.load()
-        except Exception as exc:  # pragma: no cover - defensive logging
-            print(f"⚠️ Erreur en chargeant {path.name} : {exc}")
-            return []
+    def stream(self, prepared: PreparedAnswer) -> Iterator[str]:
+        for chunk in self.model.stream(prepared.messages):
+            if chunk.content:
+                yield str(chunk.content)
 
-        for doc in documents:
-            doc.metadata.setdefault("source", str(path))
-        return documents
+    def chat(self, message: str, mode: str = "rag", history=None, session_id: str = "cli"):
+        """Non-streamed helper: returns (answer, intent, sources)."""
+        prepared = self.prepare(message, mode, history, session_id)
+        return self.answer(prepared), prepared.intent, prepared.sources
 
 
-# Global singleton to avoid rebuilding the FAISS index repeatedly.
 _ENGINE: ChatbotEngine | None = None
-_ENGINE_KEY: str | None = None
+_ENGINE_LOCK = threading.Lock()
+
 
 def get_engine() -> ChatbotEngine:
-    global _ENGINE, _ENGINE_KEY
-    current_key = os.getenv("OPENAI_API_KEY")
-
-    if not current_key:
-        raise RuntimeError("OPENAI_API_KEY must be provided in the environment.")
-
-    # Rebuild engine if first time OR if key changed
-    if _ENGINE is None or current_key != _ENGINE_KEY:
-        _ENGINE = ChatbotEngine()
-        _ENGINE_KEY = current_key
-
-    return _ENGINE
+    global _ENGINE
+    with _ENGINE_LOCK:
+        if _ENGINE is None:
+            _ENGINE = ChatbotEngine()
+        return _ENGINE

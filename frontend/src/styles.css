@@ -1096,3 +1096,97 @@ a {
     transition-duration: 0.01ms !important;
   }
 }
+
+/* --------------------------------------------------------------------------
+   Streaming, sources with excerpts, demo document
+   -------------------------------------------------------------------------- */
+
+.stream-cursor {
+  display: inline-block;
+  width: 8px;
+  height: 1.1em;
+  margin-left: 2px;
+  vertical-align: text-bottom;
+  border-radius: 2px;
+  background: rgba(79, 70, 229, 0.8);
+  animation: blink 1s steps(2, start) infinite;
+}
+
+.markdown-streaming > p:last-of-type {
+  display: inline;
+}
+
+@keyframes blink {
+  to {
+    visibility: hidden;
+  }
+}
+
+.chat-message-bubble .chat-loading-dots {
+  padding: 6px 0;
+}
+
+.chat-message-sources summary {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  cursor: pointer;
+  list-style: none;
+}
+
+.chat-message-sources summary::-webkit-details-marker {
+  display: none;
+}
+
+.chat-message-sources summary > span:first-child::after {
+  content: ' ▸';
+}
+
+.chat-message-sources[open] summary > span:first-child::after {
+  content: ' ▾';
+}
+
+.chat-message-excerpts {
+  margin: 10px 0 2px;
+  padding-left: 0;
+  list-style: none;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.chat-message-excerpt-title {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  margin: 0 0 4px;
+  font-weight: 600;
+  color: rgba(67, 56, 202, 0.95);
+}
+
+.chat-message-excerpt-title span {
+  font-weight: 500;
+  color: rgba(15, 23, 42, 0.5);
+  white-space: nowrap;
+}
+
+.chat-message-excerpts blockquote {
+  margin: 0;
+  padding: 8px 12px;
+  max-height: 140px;
+  overflow-y: auto;
+  border-left: 3px solid rgba(99, 102, 241, 0.4);
+  border-radius: 0 8px 8px 0;
+  background: rgba(255, 255, 255, 0.7);
+  white-space: pre-wrap;
+  font-size: 0.82rem;
+  line-height: 1.5;
+}
+
+.document-privacy {
+  margin: -8px 0 0;
+  font-size: 0.75rem;
+  text-align: center;
+  color: rgba(15, 23, 42, 0.45);
+}

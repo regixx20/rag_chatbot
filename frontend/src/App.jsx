@@ -14,6 +14,7 @@ import {
   WAKE_TIMEOUT_MS,
   apiFetch,
   resolveApiBase,
+  streamChat,
 } from './lib/api'
 
 // Extensions the backend knows how to load (see ChatbotEngine._load_documents_from_path)
@@ -26,9 +27,9 @@ const SUGGESTIONS = {
     'Donne-moi 3 idées de projets utilisant un chatbot',
   ],
   rag: [
-    'Résume le document que j’ai ajouté',
-    'Quels sont les points clés de ce document ?',
-    'Quelles données personnelles sont mentionnées ?',
+    'TikTok peut-il réutiliser mes vidéos ?',
+    'À partir de quel âge peut-on créer un compte ?',
+    'Comment sont réglés les litiges avec TikTok ?',
   ],
 }
 
@@ -36,7 +37,7 @@ function createWelcomeMessage() {
   return {
     id: 'welcome',
     content:
-      'Bonjour ! Posez votre question directement, ou ajoutez vos documents et activez le **mode RAG** pour obtenir des réponses basées sur leur contenu.',
+      "Bonjour ! Le **mode RAG** est activé : je réponds à partir des documents disponibles, en citant mes sources. Un document de démo est déjà chargé (les conditions d'utilisation de TikTok) — posez une question, ou ajoutez vos propres fichiers.",
     role: 'assistant',
     timestamp: new Date(),
     intent: 'System',
@@ -57,7 +58,8 @@ function normaliseDocument(apiDocument) {
     id: String(apiDocument.id ?? createMessageId('doc')),
     name,
     type: apiDocument.type || extension,
-    uploadedAt: apiDocument.uploaded_at ? new Date(apiDocument.uploaded_at) : new Date(),
+    isDemo: Boolean(apiDocument.is_demo),
+    uploadedAt: apiDocument.uploaded_at ? new Date(apiDocument.uploaded_at) : null,
   }
 }
 
@@ -66,7 +68,7 @@ export default function App() {
   const [serverState, setServerState] = useState('waking') // waking | online | offline
   const [documents, setDocuments] = useState([])
   const [messages, setMessages] = useState(() => [createWelcomeMessage()])
-  const [isRagEnabled, setIsRagEnabled] = useState(false)
+  const [isRagEnabled, setIsRagEnabled] = useState(true)
   const [isLoading, setIsLoading] = useState(false)
   const [isUploading, setIsUploading] = useState(false)
   const [isPanelOpen, setIsPanelOpen] = useState(false)
@@ -84,7 +86,7 @@ export default function App() {
         results
           .map(normaliseDocument)
           .filter(Boolean)
-          .sort((a, b) => b.uploadedAt.getTime() - a.uploadedAt.getTime())
+          .sort((a, b) => (b.uploadedAt?.getTime() ?? 0) - (a.uploadedAt?.getTime() ?? 0))
       )
     } catch (error) {
       console.error('Impossible de charger les documents', error)
@@ -134,36 +136,40 @@ export default function App() {
         .filter((entry) => entry.intent !== 'System' && entry.intent !== 'Error')
         .map(({ role, content: text }) => ({ role, content: text }))
 
+      const assistantId = createMessageId('assistant')
       setMessages([...baseMessages, userMessage])
       setIsLoading(true)
       setStatusMessage(null)
 
-      try {
-        const data = await apiFetch(`${apiBase}/chat/`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            message: trimmed,
-            mode: isRagEnabled ? 'rag' : 'direct',
-            history,
-          }),
+      const updateAssistant = (patch) =>
+        setMessages((previous) => {
+          const exists = previous.some((entry) => entry.id === assistantId)
+          const base = exists
+            ? previous
+            : [...previous, { id: assistantId, role: 'assistant', content: '', timestamp: new Date() }]
+          return base.map((entry) => (entry.id === assistantId ? { ...entry, ...patch(entry) } : entry))
         })
-        setServerState('online')
-        setMessages((previous) => [
-          ...previous,
+
+      try {
+        await streamChat(
+          apiBase,
+          { message: trimmed, mode: isRagEnabled ? 'rag' : 'direct', history },
           {
-            id: createMessageId('assistant'),
-            content: data?.response || "Je n'ai pas pu formuler de réponse.",
-            role: 'assistant',
-            timestamp: new Date(),
-            usedDocuments: Array.isArray(data?.used_documents) ? data.used_documents : [],
-            intent: data?.intent || 'Direct',
-          },
-        ])
+            onMeta: ({ intent, sources }) =>
+              updateAssistant(() => ({ intent: intent || 'Direct', sources: sources ?? [], isStreaming: true })),
+            onToken: (token) => updateAssistant((entry) => ({ content: entry.content + token })),
+          }
+        )
+        setServerState('online')
+        updateAssistant((entry) => ({
+          isStreaming: false,
+          content: entry.content || "Je n'ai pas pu formuler de réponse.",
+        }))
       } catch (error) {
         console.error("Erreur lors de l'envoi du message", error)
+        // Drop a partially streamed answer and show the error instead
         setMessages((previous) => [
-          ...previous,
+          ...previous.filter((entry) => entry.id !== assistantId),
           {
             id: createMessageId('assistant-error'),
             content: error.message,
@@ -363,7 +369,7 @@ export default function App() {
             </div>
           )}
 
-          {isLoading && (
+          {isLoading && !messages.at(-1)?.isStreaming && (
             <div className="chat-loading" role="status">
               <div className="chat-loading-icon">
                 <SparklesIcon aria-hidden="true" />

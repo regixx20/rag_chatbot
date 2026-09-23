@@ -68,23 +68,33 @@ export function DocumentPanel({
                   <div className="document-meta">
                     <span>{doc.type ? doc.type.toUpperCase() : 'Fichier'}</span>
                     <span>•</span>
-                    <span>{new Date(doc.uploadedAt).toLocaleDateString('fr-FR')}</span>
+                    {doc.isDemo ? (
+                      <Badge variant="accent">Démo</Badge>
+                    ) : (
+                      <span>{doc.uploadedAt?.toLocaleDateString('fr-FR')}</span>
+                    )}
                   </div>
                 </div>
-                <Button
-                  variant="ghost"
-                  size="sm"
-                  className="document-delete"
-                  onClick={() => onDelete?.(doc.id)}
-                  aria-label={`Supprimer ${doc.name}`}
-                >
-                  <CloseIcon />
-                </Button>
+                {!doc.isDemo && (
+                  <Button
+                    variant="ghost"
+                    size="sm"
+                    className="document-delete"
+                    onClick={() => onDelete?.(doc.id)}
+                    aria-label={`Supprimer ${doc.name}`}
+                  >
+                    <CloseIcon />
+                  </Button>
+                )}
               </Card>
             )
           })
         )}
       </ScrollArea>
+
+      <p className="document-privacy">
+        Vos fichiers ne sont visibles que par vous et sont supprimés après 24 h.
+      </p>
 
       {documents.length > 0 && (
         <div className="document-footer">

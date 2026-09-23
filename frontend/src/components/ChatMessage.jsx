@@ -3,8 +3,10 @@ import { Badge } from './ui/Badge'
 import { Button } from './ui/Button'
 import { UserIcon, SparklesIcon, DatabaseIcon, AlertIcon, FileTextIcon } from './icons'
 
-// "…/media/uploads/2025/12/15/tiktok_laws.pdf" -> "tiktok_laws.pdf"
-const fileName = (source) => String(source).split(/[\\/]/).pop()
+const documentName = (source) => source.document.replace(/\.[a-z0-9]+$/i, '').replace(/_/g, ' ')
+const sourceLabel = (source) => `${documentName(source)}${source.page ? ` · p. ${source.page}` : ''}`
+// Compact chip: the page is enough when it exists, the full label stays in the tooltip
+const sourceChip = (source) => (source.page ? `p. ${source.page}` : documentName(source))
 
 const markdownComponents = {
   a: ({ node, ...props }) => <a {...props} target="_blank" rel="noreferrer" />,
@@ -14,7 +16,8 @@ export function ChatMessage({ message, onRetry }) {
   const isUser = message.role === 'user'
   const intent = message.intent || ''
   const isError = intent === 'Error'
-  const sources = !isUser ? [...new Set((message.usedDocuments ?? []).map(fileName))] : []
+  const sources = !isUser ? message.sources ?? [] : []
+  const isWaitingFirstToken = message.isStreaming && !message.content
 
   return (
     <div
@@ -26,7 +29,7 @@ export function ChatMessage({ message, onRetry }) {
         {isUser ? <UserIcon /> : isError ? <AlertIcon /> : <SparklesIcon />}
       </div>
       <div className="chat-message-body">
-        {!isUser && (intent === 'Rag' || intent === 'NoDocuments') && (
+        {!isUser && (intent === 'Rag' || intent === 'NoContext') && (
           <div className="chat-message-badge">
             {intent === 'Rag' ? (
               <Badge variant="outline" className="chat-message-rag">
@@ -35,7 +38,7 @@ export function ChatMessage({ message, onRetry }) {
               </Badge>
             ) : (
               <Badge variant="muted" className="chat-message-warning">
-                Aucun document
+                Aucun passage pertinent
               </Badge>
             )}
           </div>
@@ -44,9 +47,16 @@ export function ChatMessage({ message, onRetry }) {
         <div className="chat-message-bubble">
           {isUser ? (
             <p>{message.content}</p>
+          ) : isWaitingFirstToken ? (
+            <div className="chat-loading-dots" aria-label="Rédaction en cours">
+              <span />
+              <span />
+              <span />
+            </div>
           ) : (
-            <div className="markdown">
+            <div className={`markdown ${message.isStreaming ? 'markdown-streaming' : ''}`}>
               <ReactMarkdown components={markdownComponents}>{message.content}</ReactMarkdown>
+              {message.isStreaming && <span className="stream-cursor" aria-hidden="true" />}
             </div>
           )}
           {isError && message.retryContent && (
@@ -56,16 +66,28 @@ export function ChatMessage({ message, onRetry }) {
           )}
         </div>
 
-        {sources.length > 0 && (
-          <div className="chat-message-sources">
-            <span>Sources :</span>
-            {sources.map((source) => (
-              <span key={source} className="chat-message-source" title={source}>
-                <FileTextIcon aria-hidden="true" />
-                {source}
-              </span>
-            ))}
-          </div>
+        {sources.length > 0 && !message.isStreaming && (
+          <details className="chat-message-sources">
+            <summary>
+              <span>Sources</span>
+              {sources.map((source) => (
+                <span key={source.number} className="chat-message-source" title={sourceLabel(source)}>
+                  <FileTextIcon aria-hidden="true" />[{source.number}] {sourceChip(source)}
+                </span>
+              ))}
+            </summary>
+            <ol className="chat-message-excerpts">
+              {sources.map((source) => (
+                <li key={source.number} value={source.number}>
+                  <p className="chat-message-excerpt-title">
+                    {sourceLabel(source)}
+                    <span>pertinence {Math.round(source.score * 100)} %</span>
+                  </p>
+                  <blockquote>{source.excerpt}</blockquote>
+                </li>
+              ))}
+            </ol>
+          </details>
         )}
 
         <span className="chat-message-time">

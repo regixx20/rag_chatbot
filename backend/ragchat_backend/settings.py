@@ -6,6 +6,8 @@ load_dotenv(override=True)
 from pathlib import Path
 import os
 
+from corsheaders.defaults import default_headers
+
 BASE_DIR = Path(__file__).resolve().parent.parent
 
 SECRET_KEY = os.getenv("DJANGO_SECRET_KEY", "django-insecure-rag-chatbot")
@@ -93,3 +95,11 @@ REST_FRAMEWORK = {
 }
 
 CORS_ALLOW_ALL_ORIGINS = True
+CORS_ALLOW_HEADERS = (*default_headers, "x-session-id")
+
+LOGGING = {
+    "version": 1,
+    "disable_existing_loggers": False,
+    "handlers": {"console": {"class": "logging.StreamHandler"}},
+    "loggers": {"ragchat": {"handlers": ["console"], "level": os.getenv("RAG_LOG_LEVEL", "INFO")}},
+}
