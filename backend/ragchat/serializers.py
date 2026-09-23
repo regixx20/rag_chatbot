@@ -25,6 +25,6 @@ class ChatMessageSerializer(serializers.Serializer):
 
 
 class ChatRequestSerializer(serializers.Serializer):
-    message = serializers.CharField(max_length=4000)
+    message = serializers.CharField(max_length=2000)
     mode = serializers.ChoiceField(choices=["rag", "direct"])
     history = ChatMessageSerializer(many=True, required=False, default=list)

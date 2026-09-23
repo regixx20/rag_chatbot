@@ -18,3 +18,18 @@ class Document(models.Model):
 
     def __str__(self) -> str:
         return self.original_name
+
+
+class UsageRecord(models.Model):
+    """One billed action (question or upload), used to enforce usage limits."""
+
+    QUESTION = "question"
+    UPLOAD = "upload"
+
+    client_id = models.CharField(max_length=64, db_index=True)
+    kind = models.CharField(max_length=16, choices=[(QUESTION, "Question"), (UPLOAD, "Upload")])
+    cost_usd = models.FloatField(default=0.0)
+    created_at = models.DateTimeField(auto_now_add=True, db_index=True)
+
+    class Meta:
+        ordering = ["-created_at"]

@@ -16,8 +16,9 @@ from rest_framework.parsers import MultiPartParser
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
-from .chatbot import SUPPORTED_EXTENSIONS, get_engine
-from .models import Document
+from . import limits
+from .chatbot import SUPPORTED_EXTENSIONS, StreamResult, get_engine
+from .models import Document, UsageRecord
 from .serializers import ChatRequestSerializer, DocumentSerializer
 
 logger = logging.getLogger(__name__)
@@ -42,9 +43,13 @@ def engine_or_error():
     except RuntimeError:
         logger.exception("Moteur de chatbot indisponible")
         return None, Response(
-            {"detail": "Le serveur n'est pas configuré (clé OpenAI manquante)."},
+            {"detail": "Le serveur n'est pas configuré (clé d'API manquante)."},
             status=status.HTTP_503_SERVICE_UNAVAILABLE,
         )
+
+
+def limit_response(error: limits.LimitExceeded) -> Response:
+    return Response({"detail": str(error)}, status=status.HTTP_429_TOO_MANY_REQUESTS)
 
 
 def purge_expired_sessions() -> None:
@@ -116,7 +121,13 @@ class DocumentViewSet(
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
+        try:
+            limits.check_upload(request, session_id)
+        except limits.LimitExceeded as exceeded:
+            return limit_response(exceeded)
+
         purge_expired_sessions()
+        limits.record(request, UsageRecord.UPLOAD)
         document = Document.objects.create(
             session_id=session_id, file=uploaded, original_name=uploaded.name
         )
@@ -160,10 +171,16 @@ class ChatView(APIView):
         if error:
             return error
 
+        try:
+            limits.check_question(request)
+        except limits.LimitExceeded as exceeded:
+            return limit_response(exceeded)
+
         data = serializer.validated_data
+        result = StreamResult()
         try:
             prepared = engine.prepare(data["message"], data["mode"], data["history"], session_id)
-            answer = engine.answer(prepared)
+            answer = engine.answer(prepared, result)
         except Exception:
             logger.exception("Échec de la génération de la réponse")
             return Response(
@@ -171,6 +188,7 @@ class ChatView(APIView):
                 status=status.HTTP_502_BAD_GATEWAY,
             )
 
+        limits.record(request, UsageRecord.QUESTION, result.cost_usd)
         sources = [source.as_dict() for source in prepared.sources]
         return Response(
             {
@@ -194,7 +212,13 @@ class ChatStreamView(APIView):
         if error:
             return error
 
+        try:
+            limits.check_question(request)
+        except limits.LimitExceeded as exceeded:
+            return limit_response(exceeded)
+
         data = serializer.validated_data
+        result = StreamResult()
         try:
             prepared = engine.prepare(data["message"], data["mode"], data["history"], session_id)
         except Exception:
@@ -216,7 +240,7 @@ class ChatStreamView(APIView):
                 }
             )
             try:
-                for token in engine.stream(prepared):
+                for token in engine.stream(prepared, result):
                     yield line({"type": "token", "content": token})
             except Exception:
                 logger.exception("Échec pendant le streaming de la réponse")
@@ -224,6 +248,9 @@ class ChatStreamView(APIView):
                     {"type": "error", "detail": "La génération de la réponse a été interrompue."}
                 )
                 return
+            finally:
+                # Count the question even when the stream fails midway (tokens were spent)
+                limits.record(request, UsageRecord.QUESTION, result.cost_usd or prepared.cost_usd)
             yield line({"type": "done"})
 
         response = StreamingHttpResponse(events(), content_type="application/x-ndjson")

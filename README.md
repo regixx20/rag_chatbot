@@ -2,7 +2,7 @@
 
 Chatbot qui répond à partir de vos documents (Retrieval-Augmented Generation), en citant ses sources avec le numéro de page.
 
-**Stack** : React (Vite) · Django REST Framework · LangChain · FAISS · OpenAI
+**Stack** : React (Vite) · Django REST Framework · Claude (Anthropic) · FAISS · embeddings OpenAI
 
 ## Fonctionnement
 
@@ -11,13 +11,13 @@ Question ──► Reformulation avec l'historique ──► Recherche vectoriel
                                                         │
                         Filtrage par seuil de pertinence ◄┘
                                      │
-          Prompt avec extraits numérotés [1] [2]… ──► LLM (réponse en streaming)
+          Prompt avec extraits numérotés [1] [2]… ──► Claude (réponse en streaming)
 ```
 
 1. **Ingestion** : le texte du fichier est extrait (numéros de page conservés pour les PDF), découpé en fragments de 1000 caractères, puis vectorisé avec `text-embedding-3-small`.
 2. **Reformulation** : une question de suivi (« et pour les mineurs ? ») est réécrite en question autonome avant la recherche.
 3. **Recherche** : les fragments les plus proches sont récupérés ; ceux dont la similarité cosinus est sous le seuil sont écartés, pour ne pas donner de contexte hors sujet au modèle.
-4. **Génération** : le modèle répond uniquement à partir des extraits, cite ses sources `[n]`, et le dit clairement quand l'information n'y figure pas.
+4. **Génération** : Claude répond uniquement à partir des extraits, cite ses sources `[n]`, et le dit clairement quand l'information n'y figure pas.
 
 Un document de démonstration (`backend/demo_docs/`) est indexé automatiquement au démarrage. Les documents ajoutés par un visiteur sont isolés dans sa session et supprimés après 24 h.
 
@@ -28,7 +28,7 @@ Un document de démonstration (`backend/demo_docs/`) est indexé automatiquement
 cd backend
 python -m venv .venv && .venv/Scripts/activate   # ou source .venv/bin/activate
 pip install -r requirements.txt
-echo OPENAI_API_KEY=sk-... > .env
+cp .env.example .env   # puis renseignez ANTHROPIC_API_KEY et OPENAI_API_KEY
 python manage.py migrate
 python manage.py runserver
 
@@ -42,13 +42,28 @@ npm run dev
 
 | Variable | Défaut | Rôle |
 |---|---|---|
-| `OPENAI_API_KEY` | — | Clé OpenAI (obligatoire) |
-| `OPENAI_CHAT_MODEL` | `gpt-4o-mini` | Modèle de génération |
+| `ANTHROPIC_API_KEY` | — | Clé Claude pour la génération (obligatoire) |
+| `OPENAI_API_KEY` | — | Clé OpenAI pour les embeddings (obligatoire) |
+| `CLAUDE_MODEL` | `claude-opus-5` | Modèle de génération |
+| `CLAUDE_ANSWER_EFFORT` | `medium` | Effort de raisonnement des réponses |
 | `OPENAI_EMBEDDING_MODEL` | `text-embedding-3-small` | Modèle d'embeddings |
 | `RAG_TOP_K` | `4` | Nombre d'extraits envoyés au modèle |
 | `RAG_MIN_RELEVANCE` | `0.3` | Similarité cosinus minimale d'un extrait |
 | `RAG_DATA_DIR` | `backend/rag_data` | Dossier des index FAISS |
 | `VITE_API_BASE_URL` | URL Render en production | URL de l'API pour le frontend |
+
+## Protection des clés et limites d'usage
+
+Les clés ne quittent jamais le serveur : le frontend n'appelle que l'API Django. Pour une démo publique, l'API applique :
+
+| Variable | Défaut | Limite |
+|---|---|---|
+| `RAG_DAILY_BUDGET_USD` | `2.0` | Budget quotidien global, calculé sur la consommation réelle de tokens |
+| `RAG_MAX_QUESTIONS_PER_HOUR` | `20` | Questions par visiteur et par heure |
+| `RAG_MAX_QUESTIONS_PER_DAY` | `60` | Questions par visiteur et par jour |
+| `RAG_MAX_DOCUMENTS_PER_SESSION` | `5` | Documents par session |
+
+Au-delà, l'API répond `429` avec un message explicite. Le plafond de dépense mensuel défini dans les consoles Anthropic et OpenAI reste la protection ultime.
 
 ## API
 

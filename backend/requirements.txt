@@ -6,9 +6,11 @@ langchain-community>=0.3
 langchain-openai>=0.2
 langchain-text-splitters>=0.3
 faiss-cpu
+anthropic
 openai>=1.0
 pypdf>=4.0
 docx2txt
 beautifulsoup4
 python-dotenv>=1.0
 gunicorn
+truststore; sys_platform == "win32"

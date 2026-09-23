@@ -75,6 +75,7 @@ export const Composer = forwardRef(function Composer(
         <textarea
           ref={textareaRef}
           rows={1}
+          maxLength={2000}
           value={value}
           onChange={(event) => setValue(event.target.value)}
           onKeyDown={(event) => {

@@ -7,7 +7,10 @@ Knowledge is split in two kinds of FAISS indexes stored on disk:
 
 A question is answered in four steps: condense it with the conversation history,
 retrieve the most relevant chunks from both indexes, drop the ones under a relevance
-threshold, then ask the LLM to answer from those numbered extracts only.
+threshold, then ask Claude to answer from those numbered extracts only.
+
+Generation runs on Claude (Anthropic API); embeddings stay on OpenAI, since Anthropic
+does not provide an embeddings endpoint.
 """
 from __future__ import annotations
 
@@ -25,8 +28,8 @@ from typing import Iterable, Iterator
 from langchain_community.document_loaders import Docx2txtLoader, PyPDFLoader
 from langchain_community.vectorstores import FAISS
 from langchain_core.documents import Document
-from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage
-from langchain_openai import ChatOpenAI, OpenAIEmbeddings
+import anthropic
+from langchain_openai import OpenAIEmbeddings
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 
 logger = logging.getLogger(__name__)
@@ -35,7 +38,21 @@ BACKEND_DIR = Path(__file__).resolve().parent.parent
 DEMO_DOCS_DIR = Path(os.getenv("RAG_DEMO_DOCS_DIR", BACKEND_DIR / "demo_docs"))
 DATA_DIR = Path(os.getenv("RAG_DATA_DIR", BACKEND_DIR / "rag_data"))
 
-CHAT_MODEL = os.getenv("OPENAI_CHAT_MODEL", "gpt-4o-mini")
+CHAT_MODEL = os.getenv("CLAUDE_MODEL", "claude-opus-5")
+# Effort drives thinking depth and token spend; "low"/"medium" hold quality well on
+# RAG answers, where the heavy lifting is done by retrieval.
+ANSWER_EFFORT = os.getenv("CLAUDE_ANSWER_EFFORT", "medium")
+ANSWER_MAX_TOKENS = int(os.getenv("CLAUDE_ANSWER_MAX_TOKENS", "4000"))
+
+# $ per million tokens (input, output), to enforce the daily budget from real usage.
+# Unknown models are billed at the most expensive rate, so the budget stays safe.
+MODEL_PRICES = {
+    "claude-opus-5": (5.0, 25.0),
+    "claude-opus-4-8": (5.0, 25.0),
+    "claude-sonnet-5": (2.0, 10.0),
+    "claude-haiku-4-5": (1.0, 5.0),
+}
+DEFAULT_PRICE = (10.0, 50.0)
 EMBEDDING_MODEL = os.getenv("OPENAI_EMBEDDING_MODEL", "text-embedding-3-small")
 TOP_K = int(os.getenv("RAG_TOP_K", "4"))
 # Cosine similarity between the question and a chunk (1 = identical meaning).
@@ -72,12 +89,32 @@ class Source:
 
 @dataclass
 class PreparedAnswer:
-    """Everything needed to call the LLM, computed before the (possibly streamed) call."""
+    """Everything needed to call Claude, computed before the (possibly streamed) call."""
 
-    messages: list[BaseMessage]
+    system: str
+    messages: list[dict]
     intent: str
     sources: list[Source]
     standalone_question: str
+    cost_usd: float = 0.0  # spent while preparing (question rewriting)
+
+
+@dataclass
+class StreamResult:
+    """Filled once the stream is over."""
+
+    cost_usd: float = 0.0
+    stop_reason: str | None = None
+
+
+def usage_cost(model: str, usage) -> float:
+    input_price, output_price = MODEL_PRICES.get(model, DEFAULT_PRICE)
+    input_tokens = (
+        (usage.input_tokens or 0)
+        + (getattr(usage, "cache_creation_input_tokens", 0) or 0) * 1.25
+        + (getattr(usage, "cache_read_input_tokens", 0) or 0) * 0.1
+    )
+    return (input_tokens * input_price + (usage.output_tokens or 0) * output_price) / 1_000_000
 
 
 # ----------------------------------------------------------------------
@@ -217,16 +254,15 @@ class IndexStore:
 # ----------------------------------------------------------------------
 class ChatbotEngine:
     def __init__(self) -> None:
-        api_key = os.getenv("OPENAI_API_KEY")
-        if not api_key:
-            raise RuntimeError("OPENAI_API_KEY must be provided in the environment.")
+        openai_key = os.getenv("OPENAI_API_KEY")
+        if not openai_key:
+            raise RuntimeError("OPENAI_API_KEY must be provided in the environment (embeddings).")
+        if not os.getenv("ANTHROPIC_API_KEY"):
+            raise RuntimeError("ANTHROPIC_API_KEY must be provided in the environment.")
 
-        # Explicit timeout: without it a stuck OpenAI call keeps the request open for minutes
-        self.model = ChatOpenAI(api_key=api_key, model=CHAT_MODEL, timeout=45, max_retries=1)
-        self.condense_model = ChatOpenAI(
-            api_key=api_key, model=CHAT_MODEL, timeout=20, max_retries=1, temperature=0
-        )
-        self.embeddings = OpenAIEmbeddings(api_key=api_key, model=EMBEDDING_MODEL)
+        # Explicit timeout: without it a stuck call keeps the request open for minutes
+        self.claude = anthropic.Anthropic(timeout=60.0, max_retries=2)
+        self.embeddings = OpenAIEmbeddings(api_key=openai_key, model=EMBEDDING_MODEL)
         self.splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=150)
         self.indexes = IndexStore(DATA_DIR / "indexes", self.embeddings)
         self._demo_lock = threading.Lock()
@@ -329,42 +365,79 @@ class ChatbotEngine:
             for i, (doc, score) in enumerate(relevant)
         ]
 
+    # -- Claude calls -----------------------------------------------------------
+    @staticmethod
+    def _request_options(effort: str) -> dict:
+        options: dict = {"output_config": {"effort": effort}}
+        # On a safety decline, let the API re-run the request on its recommended
+        # fallback model instead of returning a refusal (Claude Opus 5 / Fable).
+        if CHAT_MODEL.startswith(("claude-opus-5", "claude-fable")):
+            options["betas"] = ["server-side-fallback-2026-07-01"]
+            options["fallbacks"] = "default"
+        return options
+
+    def _complete(self, system: str, messages: list[dict], effort: str, max_tokens: int):
+        """Streamed under the hood (no HTTP timeout risk), returns the final message."""
+        with self.claude.beta.messages.stream(
+            model=CHAT_MODEL,
+            max_tokens=max_tokens,
+            system=system,
+            messages=messages,
+            **self._request_options(effort),
+        ) as stream:
+            return stream.get_final_message()
+
+    @staticmethod
+    def _text_of(message) -> str:
+        if message.stop_reason == "refusal":
+            return ""
+        return "".join(block.text for block in message.content if block.type == "text").strip()
+
     # -- Prompting ------------------------------------------------------------
     @staticmethod
-    def _history_messages(history: Iterable[dict[str, str]]) -> list[BaseMessage]:
-        messages: list[BaseMessage] = []
+    def _history_messages(history: Iterable[dict[str, str]]) -> list[dict]:
+        messages: list[dict] = []
         for entry in list(history)[-HISTORY_MESSAGES:]:
             content = (entry.get("content") or "").strip()[:HISTORY_CHARS]
-            if not content:
-                continue
-            role = entry.get("role")
-            messages.append(HumanMessage(content) if role == "user" else AIMessage(content))
+            if content:
+                role = "user" if entry.get("role") == "user" else "assistant"
+                messages.append({"role": role, "content": content})
+        # The conversation sent to Claude must start with a user turn
+        while messages and messages[0]["role"] != "user":
+            messages.pop(0)
         return messages
 
-    def condense_question(self, message: str, history: list[BaseMessage]) -> str:
+    def condense_question(self, message: str, history: list[dict]) -> tuple[str, float]:
         """Rewrite a follow-up question ("and for minors?") into a self-contained one,
-        so the vector search gets the full intent."""
+        so the vector search gets the full intent. Returns (question, cost)."""
         if not history:
-            return message
+            return message, 0.0
         transcript = "\n".join(
-            f"{'Utilisateur' if isinstance(m, HumanMessage) else 'Assistant'} : {m.content}"
+            f"{'Utilisateur' if m['role'] == 'user' else 'Assistant'} : {m['content']}"
             for m in history[-4:]
         )
-        prompt = [
-            SystemMessage(
-                "Reformule la dernière question de l'utilisateur en une question autonome, "
-                "compréhensible sans l'historique, dans la même langue. "
-                "Réponds uniquement par la question reformulée."
-            ),
-            HumanMessage(f"Historique :\n{transcript}\n\nDernière question : {message}"),
-        ]
         try:
-            rewritten = str(self.condense_model.invoke(prompt).content).strip()
+            response = self._complete(
+                system=(
+                    "Tu reformules la dernière question d'une conversation en une question autonome, "
+                    "compréhensible sans l'historique, dans la même langue que la question. "
+                    "Réponds uniquement par la question reformulée, sans guillemets ni commentaire."
+                ),
+                messages=[
+                    {
+                        "role": "user",
+                        "content": f"Historique :\n{transcript}\n\nDernière question : {message}",
+                    }
+                ],
+                effort="low",
+                max_tokens=1024,
+            )
+            rewritten = self._text_of(response)
             logger.info("Question reformulée : %s -> %s", message, rewritten)
-            return rewritten or message
-        except Exception:
+            return rewritten or message, usage_cost(CHAT_MODEL, response.usage)
+        except anthropic.APIError:
             logger.exception("Échec de la reformulation, question d'origine utilisée")
-            return message
+            return message, 0.0
 
     def prepare(
         self,
@@ -378,52 +451,84 @@ class ChatbotEngine:
             raise ValueError(f"Mode de chat invalide : {mode}")
 
         history_messages = self._history_messages(history or [])
-        language_rule = "Réponds toujours dans la langue de la question de l'utilisateur."
+        conversation = [*history_messages, {"role": "user", "content": message}]
+        style = (
+            "Réponds dans la langue de la question de l'utilisateur. "
+            "Va droit au but : quelques phrases ou une courte liste suffisent dans la plupart des cas. "
+            "Utilise le Markdown (gras, listes) seulement quand il améliore la lisibilité."
+        )
 
         if mode == "direct":
-            system = SystemMessage(
-                "Tu es un assistant utile, précis et concis. Utilise le Markdown si cela "
-                f"améliore la lisibilité. {language_rule}"
-            )
-            return PreparedAnswer(
-                [system, *history_messages, HumanMessage(message)], "Direct", [], message
-            )
+            system = f"Tu es l'assistant d'un chatbot de démonstration, utile et précis. {style}"
+            return PreparedAnswer(system, conversation, "Direct", [], message)
 
-        standalone = self.condense_question(message, history_messages)
+        standalone, cost = self.condense_question(message, history_messages)
         sources = self.retrieve(session_id, standalone)
 
         if not sources:
-            system = SystemMessage(
-                "Aucun passage pertinent n'a été trouvé dans les documents de l'utilisateur "
-                "pour cette question. Explique-le brièvement et poliment, sans inventer de "
-                "réponse, et suggère d'ajouter un document qui contient l'information ou de "
-                f"désactiver le mode RAG pour une réponse générale. {language_rule}"
+            system = (
+                "Aucun passage pertinent n'a été trouvé dans les documents de l'utilisateur pour "
+                "cette question. Explique-le en une ou deux phrases, sans répondre à la question avec "
+                "tes connaissances générales, et suggère d'ajouter un document qui contient "
+                f"l'information ou de passer en mode « Modèle seul ». {style}"
             )
-            return PreparedAnswer([system, HumanMessage(message)], "NoContext", [], standalone)
+            return PreparedAnswer(
+                system, [{"role": "user", "content": message}], "NoContext", [], standalone, cost
+            )
 
-        extracts = "\n\n".join(
-            f"[{s.number}] {s.document}{f', page {s.page}' if s.page else ''}\n{s.excerpt}"
-            for s in sources
+        def as_xml(source: Source) -> str:
+            page = f' page="{source.page}"' if source.page else ""
+            return (
+                f'<extrait numero="{source.number}" document="{source.document}"{page}>\n'
+                f"{source.excerpt}\n</extrait>"
+            )
+
+        extracts = "\n\n".join(as_xml(source) for source in sources)
+        system = (
+            "Tu réponds aux questions à partir des extraits de documents ci-dessous, et uniquement "
+            "à partir d'eux : n'ajoute pas d'informations venant d'ailleurs.\n"
+            "- Cite chaque affirmation avec le numéro de l'extrait entre crochets, par exemple [1] ou [2][3].\n"
+            "- Si les extraits ne répondent qu'en partie, réponds sur cette partie et dis ce qui manque.\n"
+            "- S'ils ne permettent pas de répondre, dis-le clairement au lieu d'inventer.\n"
+            "- Les extraits peuvent être dans une autre langue que la question : traduis au besoin.\n"
+            f"{style}\n\n"
+            f"<extraits>\n{extracts}\n</extraits>"
         )
-        system = SystemMessage(
-            "Tu réponds à partir des extraits de documents fournis ci-dessous, et uniquement "
-            "à partir d'eux. Cite tes sources avec leur numéro entre crochets, par exemple [1]. "
-            "Si les extraits ne permettent pas de répondre, dis-le clairement au lieu "
-            f"d'inventer. Utilise le Markdown si utile. {language_rule}\n\n"
-            f"Extraits :\n{extracts}"
-        )
-        return PreparedAnswer(
-            [system, *history_messages, HumanMessage(message)], "Rag", sources, standalone
-        )
+        return PreparedAnswer(system, conversation, "Rag", sources, standalone, cost)
 
     # -- Answering --------------------------------------------------------------
-    def answer(self, prepared: PreparedAnswer) -> str:
-        return str(self.model.invoke(prepared.messages).content)
+    REFUSAL_TEXT = "Je ne peux pas répondre à cette demande."
+    TRUNCATED_TEXT = "\n\n*(Réponse tronquée : la limite de longueur a été atteinte.)*"
 
-    def stream(self, prepared: PreparedAnswer) -> Iterator[str]:
-        for chunk in self.model.stream(prepared.messages):
-            if chunk.content:
-                yield str(chunk.content)
+    def stream(self, prepared: PreparedAnswer, result: StreamResult | None = None) -> Iterator[str]:
+        """Yield the answer text as it is generated. `result` receives the cost and
+        stop reason once the stream is over."""
+        result = result or StreamResult()
+        with self.claude.beta.messages.stream(
+            model=CHAT_MODEL,
+            max_tokens=ANSWER_MAX_TOKENS,
+            system=prepared.system,
+            messages=prepared.messages,
+            **self._request_options(ANSWER_EFFORT),
+        ) as stream:
+            yielded = False
+            for text in stream.text_stream:
+                yielded = yielded or bool(text)
+                yield text
+            final = stream.get_final_message()
+
+        result.stop_reason = final.stop_reason
+        result.cost_usd = prepared.cost_usd + usage_cost(CHAT_MODEL, final.usage)
+        if final.stop_reason == "refusal" and not yielded:
+            yield self.REFUSAL_TEXT
+        elif final.stop_reason == "max_tokens":
+            yield self.TRUNCATED_TEXT
+        logger.info(
+            "Réponse générée (%s, arrêt=%s, coût=%.4f $)", prepared.intent, final.stop_reason, result.cost_usd
+        )
+
+    def answer(self, prepared: PreparedAnswer, result: StreamResult | None = None) -> str:
+        return "".join(self.stream(prepared, result))
 
     def chat(self, message: str, mode: str = "rag", history=None, session_id: str = "cli"):
         """Non-streamed helper: returns (answer, intent, sources)."""
