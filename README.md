@@ -14,8 +14,8 @@ Question ──► Reformulation avec l'historique ──► Recherche vectoriel
           Prompt avec extraits numérotés [1] [2]… ──► Gemini (réponse en streaming)
 ```
 
-1. **Ingestion** : le texte du fichier est extrait (numéros de page conservés pour les PDF), découpé en fragments de 1000 caractères, puis vectorisé avec `gemini-embedding-2`.
-2. **Reformulation** : une question de suivi (« et pour les mineurs ? ») est réécrite en question autonome avant la recherche.
+1. **Ingestion** : le texte du fichier est extrait (numéros de page conservés pour les PDF), découpé en fragments de 1500 caractères, puis vectorisé avec `gemini-embedding-2`.
+2. **Reformulation** : la question est réécrite en requête autonome (une question de suivi comme « et pour les mineurs ? » récupère son contexte), dans sa langue et en anglais, pour trouver aussi les passages de documents dans une autre langue.
 3. **Recherche** : les fragments les plus proches sont récupérés ; ceux dont la similarité cosinus est sous le seuil sont écartés, pour ne pas donner de contexte hors sujet au modèle.
 4. **Génération** : le modèle répond uniquement à partir des extraits, cite ses sources `[n]`, et le dit clairement quand l'information n'y figure pas.
 
@@ -43,11 +43,11 @@ npm run dev
 | Variable | Défaut | Rôle |
 |---|---|---|
 | `GEMINI_API_KEY` | — | Clé Gemini, gratuite (obligatoire) |
-| `GEMINI_MODELS` | `gemini-3.8-flash,gemini-3.5-flash,gemini-3.5-flash-lite` | Modèles essayés dans l'ordre quand un quota gratuit est épuisé |
+| `GEMINI_MODELS` | `gemini-3.5-flash-lite,gemini-3.6-flash,gemini-3.1-flash-lite` | Modèles essayés dans l'ordre (quota épuisé, surcharge ou lenteur) |
 | `GEMINI_ANSWER_THINKING` | `LOW` | Niveau de réflexion des réponses |
 | `GEMINI_EMBEDDING_MODEL` | `gemini-embedding-2` | Modèle d'embeddings (768 dimensions) |
-| `RAG_TOP_K` | `4` | Nombre d'extraits envoyés au modèle |
-| `RAG_MIN_RELEVANCE` | `0.3` | Similarité cosinus minimale d'un extrait |
+| `RAG_TOP_K` | `6` | Nombre d'extraits envoyés au modèle |
+| `RAG_MIN_RELEVANCE` | `0.6` | Similarité cosinus minimale d'un extrait (calibrée sur gemini-embedding-2) |
 | `RAG_DATA_DIR` | `backend/rag_data` | Dossier des index FAISS |
 | `VITE_API_BASE_URL` | URL Render en production | URL de l'API pour le frontend |
 

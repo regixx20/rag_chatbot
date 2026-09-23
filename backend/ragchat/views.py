@@ -17,7 +17,7 @@ from rest_framework.response import Response
 from rest_framework.views import APIView
 
 from . import limits
-from .chatbot import SUPPORTED_EXTENSIONS, QuotaExhausted, StreamResult, get_engine
+from .chatbot import SUPPORTED_EXTENSIONS, DocumentTooLarge, QuotaExhausted, StreamResult, get_engine
 from .models import Document, UsageRecord
 from .serializers import ChatRequestSerializer, DocumentSerializer
 
@@ -133,19 +133,20 @@ class DocumentViewSet(
         )
         logger.info("Téléversement reçu : %s (%s octets)", uploaded.name, uploaded.size)
 
+        detail = "Impossible d'extraire du texte de ce fichier (document scanné, vide ou protégé ?)."
         try:
             chunk_count = engine.ingest(session_id, document.id, Path(document.file.path), uploaded.name)
+        except DocumentTooLarge as too_large:
+            chunk_count, detail = 0, str(too_large)
         except Exception:
             logger.exception("Échec de l'indexation de %s", uploaded.name)
             chunk_count = 0
+            detail = "L'analyse du document a échoué (service saturé ?). Réessayez dans une minute."
 
         if chunk_count == 0:
             document.file.delete(save=False)
             document.delete()
-            return Response(
-                {"detail": "Impossible d'extraire du texte de ce fichier (document scanné, vide ou protégé ?)."},
-                status=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            )
+            return Response({"detail": detail}, status=status.HTTP_422_UNPROCESSABLE_ENTITY)
 
         document.chunk_count = chunk_count
         document.save(update_fields=["chunk_count"])

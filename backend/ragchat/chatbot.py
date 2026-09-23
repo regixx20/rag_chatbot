@@ -20,8 +20,10 @@ import json
 import logging
 import os
 import shutil
+import re
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, Iterator
@@ -33,6 +35,7 @@ import numpy as np
 from google import genai
 from google.genai import errors as genai_errors
 from google.genai import types
+import httpx
 from langchain_core.embeddings import Embeddings
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 
@@ -42,25 +45,50 @@ BACKEND_DIR = Path(__file__).resolve().parent.parent
 DEMO_DOCS_DIR = Path(os.getenv("RAG_DEMO_DOCS_DIR", BACKEND_DIR / "demo_docs"))
 DATA_DIR = Path(os.getenv("RAG_DATA_DIR", BACKEND_DIR / "rag_data"))
 
-# Tried in order: when a model's free-tier quota is exhausted (HTTP 429) the next one
-# answers instead. Override with a comma-separated list.
+# Tried in order: when a model is out of free-tier quota (429), overloaded (503) or too
+# slow, the next one answers instead. Ordered by measured free-tier latency (flash-lite
+# answers in ~1 s while the bigger Flash models are often saturated). Comma-separated.
 CHAT_MODELS = [
     model.strip()
     for model in os.getenv(
-        "GEMINI_MODELS", "gemini-3.8-flash,gemini-3.5-flash,gemini-3.5-flash-lite"
+        "GEMINI_MODELS",
+        "gemini-3.5-flash-lite,gemini-3.1-flash-lite,gemini-3.6-flash,gemini-3.5-flash,gemini-3.7-flash,gemini-3.8-flash",
+    ).split(",")
+    if model.strip()
+]
+# Query rewriting is a small task: light models answer faster and have their own quota
+REWRITE_MODELS = [
+    model.strip()
+    for model in os.getenv(
+        "GEMINI_REWRITE_MODELS", "gemini-3.1-flash-lite,gemini-3.5-flash-lite,gemini-3.6-flash"
     ).split(",")
     if model.strip()
 ]
 ANSWER_THINKING = os.getenv("GEMINI_ANSWER_THINKING", "LOW")
+# Free-tier latency varies a lot from one minute to the next: rather than waiting on a
+# saturated model, give each one a short deadline for its first token, then move on.
+# (The API rejects deadlines under 10 s.)
+ANSWER_TIMEOUT_S = float(os.getenv("GEMINI_ANSWER_TIMEOUT", "20"))
+REWRITE_TIMEOUT_S = float(os.getenv("GEMINI_REWRITE_TIMEOUT", "10"))
+# Number of models asked in parallel; the first to answer wins (each has its own quota)
+RACE_WIDTH = int(os.getenv("GEMINI_RACE_WIDTH", "2"))
+# Whatever happens, stop trying new models after this long and tell the user
+FALLBACK_BUDGET_S = float(os.getenv("GEMINI_FALLBACK_BUDGET", "45"))
 ANSWER_MAX_TOKENS = int(os.getenv("GEMINI_ANSWER_MAX_TOKENS", "4000"))
 EMBEDDING_MODEL = os.getenv("GEMINI_EMBEDDING_MODEL", "gemini-embedding-2")
 EMBEDDING_DIMENSIONS = int(os.getenv("GEMINI_EMBEDDING_DIMENSIONS", "768"))
-TOP_K = int(os.getenv("RAG_TOP_K", "4"))
+TOP_K = int(os.getenv("RAG_TOP_K", "6"))
 # Cosine similarity between the question and a chunk (1 = identical meaning).
 # Chunks below this score are ignored instead of being fed to the LLM.
-MIN_RELEVANCE = float(os.getenv("RAG_MIN_RELEVANCE", "0.3"))
+# Calibrated on gemini-embedding-2: relevant chunks score 0.65-0.8, off-topic ones < 0.58.
+MIN_RELEVANCE = float(os.getenv("RAG_MIN_RELEVANCE", "0.6"))
 HISTORY_MESSAGES = int(os.getenv("RAG_HISTORY_MESSAGES", "8"))
 HISTORY_CHARS = 1500
+
+CHUNK_SIZE = 1500
+# Free tier: 100 embedded texts per minute. A visitor document is capped so its
+# indexing fits in about a minute (~90 chunks of 1500 characters, ~40 pages).
+MAX_CHUNKS_PER_DOCUMENT = int(os.getenv("RAG_MAX_CHUNKS_PER_DOCUMENT", "90"))
 
 SUPPORTED_EXTENSIONS = {".pdf", ".docx", ".txt", ".md", ".html", ".htm", ".xml", ".json", ".csv"}
 DEMO_INDEX = "demo"
@@ -109,14 +137,46 @@ class StreamResult:
     model: str | None = None
 
 
+class DocumentTooLarge(ValueError):
+    """The document would need more embedding requests than the free tier allows."""
+
+
 class QuotaExhausted(RuntimeError):
     """Every configured model is out of free-tier quota for now."""
 
-    MESSAGE = "Le quota gratuit du modèle est momentanément épuisé. Réessayez dans une minute."
+    MESSAGE = "Les modèles gratuits sont momentanément saturés. Réessayez dans une minute."
 
 
-def _is_quota_error(error: Exception) -> bool:
-    return isinstance(error, genai_errors.ClientError) and error.code in (404, 429)
+# A model that times out or drops the connection is treated like an overloaded one
+httpx_errors = (httpx.TimeoutException, httpx.TransportError)
+
+
+_RACE_POOL = ThreadPoolExecutor(max_workers=8, thread_name_prefix="gemini-race")
+
+
+def _close_loser(future, winner) -> None:
+    """Close the stream of a model that answered after the race was won."""
+    if future.cancelled() or future.exception() is not None:
+        return
+    result = future.result()
+    if result is not winner:
+        close = getattr(result[2], "close", None)
+        if close:
+            close()
+
+
+def _retry_delay(error: Exception, default: float) -> float:
+    """Delay suggested by the API ("Please retry in 39.2s"), capped to one minute."""
+    match = re.search(r"retry in ([\d.]+)s", str(error))
+    return min(float(match.group(1)) + 1, 65.0) if match else default
+
+
+def _should_fall_back(error: Exception) -> bool:
+    """Quota exhausted (429), model unavailable (404) or overloaded (500/503):
+    worth trying the next model. Other errors (bad request, bad key) are not."""
+    if isinstance(error, genai_errors.ClientError):
+        return error.code in (404, 429)
+    return isinstance(error, genai_errors.ServerError)
 
 
 # ----------------------------------------------------------------------
@@ -131,6 +191,7 @@ class GeminiEmbeddings(Embeddings):
     """
 
     BATCH_SIZE = 50
+    MAX_ATTEMPTS = 4
 
     def __init__(self, client: genai.Client) -> None:
         self.client = client
@@ -140,7 +201,7 @@ class GeminiEmbeddings(Embeddings):
         for start in range(0, len(texts), self.BATCH_SIZE):
             batch = texts[start : start + self.BATCH_SIZE]
             contents = [types.Content(parts=[types.Part(text=text)]) for text in batch]
-            for attempt in range(4):
+            for attempt in range(self.MAX_ATTEMPTS):
                 try:
                     response = self.client.models.embed_content(
                         model=EMBEDDING_MODEL,
@@ -148,11 +209,14 @@ class GeminiEmbeddings(Embeddings):
                         config=types.EmbedContentConfig(output_dimensionality=EMBEDDING_DIMENSIONS),
                     )
                     break
-                except genai_errors.ClientError as error:
-                    # Free tier: requests per minute are limited, wait and retry
-                    if error.code != 429 or attempt == 3:
+                except genai_errors.APIError as error:
+                    # Free tier: each text counts as one request (100 per minute), and
+                    # models get overloaded at peak times: wait as told, then retry
+                    if not _should_fall_back(error) or attempt == self.MAX_ATTEMPTS - 1:
                         raise
-                    time.sleep(2 ** attempt * 5)
+                    delay = _retry_delay(error, default=2 ** attempt * 5)
+                    logger.warning("Quota d'embeddings atteint, nouvel essai dans %.0f s", delay)
+                    time.sleep(delay)
             for embedding in response.embeddings:
                 vector = np.asarray(embedding.values, dtype="float32")
                 vectors.append((vector / (np.linalg.norm(vector) or 1.0)).tolist())
@@ -231,15 +295,19 @@ class IndexStore:
     def __init__(self, root: Path, embeddings: Embeddings) -> None:
         self.root = root
         self.embeddings = embeddings
-        self._cache: dict[str, tuple[float, FAISS]] = {}
+        self._cache: dict[str, tuple[int, FAISS]] = {}
         self._lock = threading.RLock()
 
     def _dir(self, key: str) -> Path:
         return self.root / key
 
-    def _mtime(self, key: str) -> float | None:
-        index_file = self._dir(key) / "index.faiss"
-        return index_file.stat().st_mtime if index_file.exists() else None
+    # FAISS's C++ file I/O cannot open non-ASCII paths on Windows (e.g. C:\Users\Régix),
+    # so indexes are serialised in memory and written with Python instead.
+    INDEX_FILE = "index.bin"
+
+    def _mtime(self, key: str) -> int | None:
+        index_file = self._dir(key) / self.INDEX_FILE
+        return index_file.stat().st_mtime_ns if index_file.exists() else None
 
     def get(self, key: str) -> FAISS | None:
         with self._lock:
@@ -250,8 +318,10 @@ class IndexStore:
             cached = self._cache.get(key)
             if cached and cached[0] == mtime:
                 return cached[1]
-            store = FAISS.load_local(
-                str(self._dir(key)), self.embeddings, allow_dangerous_deserialization=True
+            store = FAISS.deserialize_from_bytes(
+                (self._dir(key) / self.INDEX_FILE).read_bytes(),
+                self.embeddings,
+                allow_dangerous_deserialization=True,  # only files written by this server
             )
             self._cache[key] = (mtime, store)
             return store
@@ -259,8 +329,8 @@ class IndexStore:
     def _save(self, key: str, store: FAISS) -> None:
         directory = self._dir(key)
         directory.mkdir(parents=True, exist_ok=True)
-        store.save_local(str(directory))
-        self._cache[key] = (self._mtime(key) or 0.0, store)
+        (directory / self.INDEX_FILE).write_bytes(store.serialize_to_bytes())
+        self._cache[key] = (self._mtime(key) or 0, store)
 
     def add(self, key: str, chunks: list[Document], ids: list[str]) -> None:
         with self._lock:
@@ -309,10 +379,20 @@ class ChatbotEngine:
             raise RuntimeError("GEMINI_API_KEY must be provided in the environment.")
 
         # Explicit timeout (ms): without it a stuck call keeps the request open for minutes
-        self.gemini = genai.Client(api_key=api_key, http_options=types.HttpOptions(timeout=60_000))
+        # One HTTP attempt per model: on overload the next model is tried right away,
+        # instead of the SDK retrying the same saturated model for a long time
+        self.gemini = genai.Client(
+            api_key=api_key,
+            http_options=types.HttpOptions(
+                timeout=30_000, retry_options=types.HttpRetryOptions(attempts=1)
+            ),
+        )
         self.embeddings = GeminiEmbeddings(self.gemini)
-        self.splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=150)
+        self.splitter = RecursiveCharacterTextSplitter(chunk_size=CHUNK_SIZE, chunk_overlap=200)
         self.indexes = IndexStore(DATA_DIR / "indexes", self.embeddings)
+        # The demo index is committed next to the demo files: a server that wakes up
+        # loads it instead of re-embedding the whole corpus (free-tier quota)
+        self.demo_indexes = IndexStore(DEMO_DOCS_DIR, self.embeddings)
         self._demo_lock = threading.Lock()
         logger.info("Moteur RAG prêt (chat=%s, embeddings=%s)", CHAT_MODELS, EMBEDDING_MODEL)
 
@@ -327,7 +407,7 @@ class ChatbotEngine:
         )
 
     def _demo_fingerprint(self) -> str:
-        digest = hashlib.sha256(f"{EMBEDDING_MODEL}:{EMBEDDING_DIMENSIONS}".encode())
+        digest = hashlib.sha256(f"{EMBEDDING_MODEL}:{EMBEDDING_DIMENSIONS}:{CHUNK_SIZE}".encode())
         for path in self.demo_files():
             digest.update(path.name.encode())
             digest.update(path.read_bytes())
@@ -337,9 +417,9 @@ class ChatbotEngine:
         """(Re)build the demo index when missing or outdated. Cheap no-op otherwise."""
         with self._demo_lock:
             fingerprint = self._demo_fingerprint()
-            if self.indexes.read_meta(DEMO_INDEX) == fingerprint and self.indexes.get(DEMO_INDEX):
+            if self.demo_indexes.read_meta(DEMO_INDEX) == fingerprint and self.demo_indexes.get(DEMO_INDEX):
                 return
-            self.indexes.drop(DEMO_INDEX)
+            self.demo_indexes.drop(DEMO_INDEX)
             chunks: list[Document] = []
             for path in self.demo_files():
                 chunks.extend(self.splitter.split_documents(load_file(path)))
@@ -347,8 +427,8 @@ class ChatbotEngine:
                 for chunk in chunks:
                     chunk.metadata["is_demo"] = True
                 ids = [f"demo:{i}" for i in range(len(chunks))]
-                self.indexes.add(DEMO_INDEX, chunks, ids)
-                self.indexes.write_meta(DEMO_INDEX, fingerprint)
+                self.demo_indexes.add(DEMO_INDEX, chunks, ids)
+                self.demo_indexes.write_meta(DEMO_INDEX, fingerprint)
             logger.info("Index de démo construit : %s fragments", len(chunks))
 
     # -- Session documents ----------------------------------------------
@@ -361,6 +441,11 @@ class ChatbotEngine:
         chunks = self.splitter.split_documents(load_file(path, display_name))
         if not chunks:
             return 0
+        if len(chunks) > MAX_CHUNKS_PER_DOCUMENT:
+            raise DocumentTooLarge(
+                f"Document trop long pour la démo gratuite (environ {MAX_CHUNKS_PER_DOCUMENT * CHUNK_SIZE // 3500} "
+                "pages maximum). Essayez avec un extrait plus court."
+            )
         for chunk in chunks:
             chunk.metadata["document_id"] = document_id
         ids = [f"{document_id}:{i}" for i in range(len(chunks))]
@@ -376,28 +461,37 @@ class ChatbotEngine:
         self.indexes.drop(self.session_key(session_id))
 
     # -- Retrieval --------------------------------------------------------
-    def retrieve(self, session_id: str, query: str) -> list[Source]:
+    def retrieve(self, session_id: str, queries: list[str]) -> list[Source]:
+        """Search every query in the visitor's documents and the demo corpus, keep each
+        chunk's best score, drop what is under the relevance threshold."""
         self.ensure_demo_index()
-        candidates: list[tuple[Document, float]] = []
-        for key in (self.session_key(session_id), DEMO_INDEX):
-            store = self.indexes.get(key)
-            if store is not None:
+        stores = [
+            store
+            for store in (self.indexes.get(self.session_key(session_id)), self.demo_indexes.get(DEMO_INDEX))
+            if store is not None
+        ]
+        best: dict[str, tuple[Document, float]] = {}
+        for query in queries:
+            for store in stores:
                 # FAISS returns squared L2 distances; embeddings are unit vectors,
                 # so cosine similarity = 1 - d² / 2
-                candidates.extend(
-                    (doc, 1 - float(distance) / 2)
-                    for doc, distance in store.similarity_search_with_score(query, k=TOP_K)
-                )
+                for doc, distance in store.similarity_search_with_score(query, k=TOP_K + 2):
+                    score = 1 - float(distance) / 2
+                    key = hashlib.sha1(
+                        f"{doc.metadata.get('source')}|{doc.metadata.get('page')}|{doc.page_content}".encode()
+                    ).hexdigest()
+                    if key not in best or score > best[key][1]:
+                        best[key] = (doc, score)
 
         relevant = sorted(
-            (item for item in candidates if item[1] >= MIN_RELEVANCE),
+            (item for item in best.values() if item[1] >= MIN_RELEVANCE),
             key=lambda item: item[1],
             reverse=True,
         )[:TOP_K]
         logger.info(
-            "Recherche '%s' : %s candidats, %s retenus (scores %s)",
-            query,
-            len(candidates),
+            "Recherche %s : %s candidats, %s retenus (scores %s)",
+            queries,
+            len(best),
             len(relevant),
             [round(score, 2) for _, score in relevant],
         )
@@ -415,11 +509,14 @@ class ChatbotEngine:
 
     # -- Gemini calls -----------------------------------------------------------
     @staticmethod
-    def _config(system: str, thinking: str, max_tokens: int) -> types.GenerateContentConfig:
+    def _config(system: str, thinking: str, max_tokens: int, timeout_s: float) -> types.GenerateContentConfig:
         return types.GenerateContentConfig(
             system_instruction=system,
             max_output_tokens=max_tokens,
             thinking_config=types.ThinkingConfig(thinking_level=thinking),
+            http_options=types.HttpOptions(
+                timeout=int(timeout_s * 1000), retry_options=types.HttpRetryOptions(attempts=1)
+            ),
         )
 
     @staticmethod
@@ -432,29 +529,66 @@ class ChatbotEngine:
             for message in messages
         ]
 
-    def _open_stream(self, system: str, messages: list[dict], thinking: str, max_tokens: int):
-        """Start a stream on the first model that has quota left.
-        Returns (model, first_chunk, iterator) so the fallback happens before any text is sent."""
-        last_error: Exception | None = None
-        for model in CHAT_MODELS:
-            try:
-                iterator = iter(
-                    self.gemini.models.generate_content_stream(
-                        model=model,
-                        contents=self._contents(messages),
-                        config=self._config(system, thinking, max_tokens),
-                    )
+    def _open_stream(
+        self,
+        system: str,
+        messages: list[dict],
+        thinking: str,
+        max_tokens: int,
+        models: list[str],
+        timeout_s: float = ANSWER_TIMEOUT_S,
+    ):
+        """Start a stream on the first model able to answer.
+
+        Models are raced RACE_WIDTH at a time: each free-tier model has its own quota and
+        load, so asking two at once and keeping the first to produce a token avoids
+        waiting for a saturated one to time out. Returns (model, first_chunk, iterator),
+        so any fallback happens before a single token reaches the user."""
+
+        def start(model: str):
+            iterator = iter(
+                self.gemini.models.generate_content_stream(
+                    model=model,
+                    contents=self._contents(messages),
+                    config=self._config(system, thinking, max_tokens, timeout_s),
                 )
-                return model, next(iterator, None), iterator
-            except genai_errors.ClientError as error:
-                if not _is_quota_error(error):
-                    raise
-                logger.warning("Quota épuisé ou modèle indisponible (%s), modèle suivant", model)
-                last_error = error
+            )
+            return model, next(iterator, None), iterator
+
+        last_error: Exception | None = None
+        started = time.monotonic()
+        remaining = list(models)
+        while remaining and time.monotonic() - started <= FALLBACK_BUDGET_S:
+            batch, remaining = remaining[:RACE_WIDTH], remaining[RACE_WIDTH:]
+            futures = [_RACE_POOL.submit(start, model) for model in batch]
+            winner = None
+            for future in as_completed(futures):
+                try:
+                    winner = future.result()
+                    break
+                except (genai_errors.APIError, *httpx_errors) as error:
+                    if isinstance(error, genai_errors.APIError) and not _should_fall_back(error):
+                        raise
+                    reason = getattr(error, "code", None) or type(error).__name__
+                    logger.warning("Modèle indisponible (%s), on continue", reason)
+                    last_error = error
+            # Losers keep running in the background: close their stream once they answer
+            for future in futures:
+                future.add_done_callback(lambda f, w=winner: _close_loser(f, w))
+            if winner is not None:
+                return winner
         raise QuotaExhausted(QuotaExhausted.MESSAGE) from last_error
 
-    def _complete(self, system: str, messages: list[dict], thinking: str, max_tokens: int) -> str:
-        _, first, iterator = self._open_stream(system, messages, thinking, max_tokens)
+    def _complete(
+        self,
+        system: str,
+        messages: list[dict],
+        thinking: str,
+        max_tokens: int,
+        models: list[str],
+        timeout_s: float = ANSWER_TIMEOUT_S,
+    ) -> str:
+        _, first, iterator = self._open_stream(system, messages, thinking, max_tokens, models, timeout_s)
         chunks = [first, *iterator] if first is not None else []
         return "".join(chunk.text or "" for chunk in chunks).strip()
 
@@ -472,36 +606,38 @@ class ChatbotEngine:
             messages.pop(0)
         return messages
 
-    def condense_question(self, message: str, history: list[dict]) -> tuple[str, float]:
-        """Rewrite a follow-up question ("and for minors?") into a self-contained one,
-        so the vector search gets the full intent. Returns (question, cost)."""
-        if not history:
-            return message, 0.0
+    def search_queries(self, message: str, history: list[dict]) -> list[str]:
+        """Turn the question into self-contained search queries: one in the user's language,
+        one in English. Follow-ups ("and for minors?") get the context of the conversation,
+        and an English query finds passages of English documents asked about in French."""
         transcript = "\n".join(
-            f"{'Utilisateur' if m['role'] == 'user' else 'Assistant'} : {m['content']}"
+            f"{'Utilisateur' if m['role'] == 'user' else 'Assistant'} : {m['content'][:500]}"
             for m in history[-4:]
         )
+        prompt = (f"Historique :\n{transcript}\n\n" if transcript else "") + f"Question : {message}"
         try:
-            rewritten = self._complete(
+            text = self._complete(
                 system=(
-                    "Tu reformules la dernière question d'une conversation en une question autonome, "
-                    "compréhensible sans l'historique, dans la même langue que la question. "
-                    "Réponds uniquement par la question reformulée, sans guillemets ni commentaire."
+                    "Tu prépares une recherche dans des documents. Réécris la question en requête de "
+                    "recherche autonome, compréhensible sans l'historique et avec les mots-clés utiles. "
+                    "Réponds avec exactement deux lignes, sans numérotation ni commentaire : "
+                    "ligne 1, la requête dans la langue de la question ; ligne 2, la même requête en anglais."
                 ),
-                messages=[
-                    {
-                        "role": "user",
-                        "content": f"Historique :\n{transcript}\n\nDernière question : {message}",
-                    }
-                ],
-                thinking="LOW",
-                max_tokens=1024,
+                messages=[{"role": "user", "content": prompt}],
+                thinking="MINIMAL",
+                max_tokens=300,
+                models=REWRITE_MODELS,
+                timeout_s=REWRITE_TIMEOUT_S,
             )
-            logger.info("Question reformulée : %s -> %s", message, rewritten)
-            return rewritten or message, 0.0
-        except genai_errors.APIError:
-            logger.exception("Échec de la reformulation, question d'origine utilisée")
-            return message, 0.0
+        except (genai_errors.APIError, QuotaExhausted, *httpx_errors) as error:
+            # Expected on a saturated free tier: search with the raw question instead
+            logger.warning("Reformulation indisponible (%s), question d'origine utilisée", error)
+            return [message]
+
+        queries = [re.sub(r"^\s*(?:\d+[.)]|[-*•])\s*", "", line).strip() for line in text.splitlines()]
+        queries = list(dict.fromkeys(q for q in queries if q))[:2]
+        logger.info("Requêtes de recherche : %s -> %s", message, queries)
+        return queries or [message]
 
     def prepare(
         self,
@@ -526,8 +662,9 @@ class ChatbotEngine:
             system = f"Tu es l'assistant d'un chatbot de démonstration, utile et précis. {style}"
             return PreparedAnswer(system, conversation, "Direct", [], message)
 
-        standalone, cost = self.condense_question(message, history_messages)
-        sources = self.retrieve(session_id, standalone)
+        queries = self.search_queries(message, history_messages)
+        standalone, cost = queries[0], 0.0
+        sources = self.retrieve(session_id, queries)
 
         if not sources:
             system = (
@@ -569,7 +706,7 @@ class ChatbotEngine:
         and the finish reason once the stream is over."""
         result = result or StreamResult()
         model, first, iterator = self._open_stream(
-            prepared.system, prepared.messages, ANSWER_THINKING, ANSWER_MAX_TOKENS
+            prepared.system, prepared.messages, ANSWER_THINKING, ANSWER_MAX_TOKENS, CHAT_MODELS
         )
         result.model = model
         yielded = False
