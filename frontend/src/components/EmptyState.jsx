@@ -1,9 +1,9 @@
 import { ArrowRight } from 'lucide-react'
 
 const DEMO_QUESTIONS = [
-  'TikTok peut-il réutiliser mes vidéos ?',
-  'À partir de quel âge peut-on créer un compte ?',
   'Comment sont réglés les litiges avec TikTok ?',
+  'Que se passe-t-il si je supprime mon compte ?',
+  'Qui est propriétaire des vidéos que je publie ?',
   'Dans quels cas mon compte peut-il être suspendu ?',
 ]
 
