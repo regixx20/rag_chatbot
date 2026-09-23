@@ -3,11 +3,10 @@ djangorestframework>=3.14,<4.0
 django-cors-headers>=3.14,<4.0
 langchain-core>=0.3
 langchain-community>=0.3
-langchain-openai>=0.2
 langchain-text-splitters>=0.3
 faiss-cpu
-anthropic
-openai>=1.0
+google-genai>=2.0
+numpy
 pypdf>=4.0
 docx2txt
 beautifulsoup4

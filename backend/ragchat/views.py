@@ -17,7 +17,7 @@ from rest_framework.response import Response
 from rest_framework.views import APIView
 
 from . import limits
-from .chatbot import SUPPORTED_EXTENSIONS, StreamResult, get_engine
+from .chatbot import SUPPORTED_EXTENSIONS, QuotaExhausted, StreamResult, get_engine
 from .models import Document, UsageRecord
 from .serializers import ChatRequestSerializer, DocumentSerializer
 
@@ -37,7 +37,7 @@ def get_session_id(request) -> str:
 
 
 def engine_or_error():
-    """Return (engine, None) or (None, error response) when OpenAI isn't configured."""
+    """Return (engine, None) or (None, error response) when the API key isn't configured."""
     try:
         return get_engine(), None
     except RuntimeError:
@@ -181,6 +181,8 @@ class ChatView(APIView):
         try:
             prepared = engine.prepare(data["message"], data["mode"], data["history"], session_id)
             answer = engine.answer(prepared, result)
+        except QuotaExhausted as exhausted:
+            return Response({"detail": str(exhausted)}, status=status.HTTP_503_SERVICE_UNAVAILABLE)
         except Exception:
             logger.exception("Échec de la génération de la réponse")
             return Response(
@@ -242,6 +244,9 @@ class ChatStreamView(APIView):
             try:
                 for token in engine.stream(prepared, result):
                     yield line({"type": "token", "content": token})
+            except QuotaExhausted as exhausted:
+                yield line({"type": "error", "detail": str(exhausted)})
+                return
             except Exception:
                 logger.exception("Échec pendant le streaming de la réponse")
                 yield line(

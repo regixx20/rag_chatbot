@@ -2,7 +2,7 @@
 
 Chatbot qui répond à partir de vos documents (Retrieval-Augmented Generation), en citant ses sources avec le numéro de page.
 
-**Stack** : React (Vite) · Django REST Framework · Claude (Anthropic) · FAISS · embeddings OpenAI
+**Stack** : React (Vite) · Django REST Framework · Gemini API · FAISS
 
 ## Fonctionnement
 
@@ -11,13 +11,13 @@ Question ──► Reformulation avec l'historique ──► Recherche vectoriel
                                                         │
                         Filtrage par seuil de pertinence ◄┘
                                      │
-          Prompt avec extraits numérotés [1] [2]… ──► Claude (réponse en streaming)
+          Prompt avec extraits numérotés [1] [2]… ──► Gemini (réponse en streaming)
 ```
 
-1. **Ingestion** : le texte du fichier est extrait (numéros de page conservés pour les PDF), découpé en fragments de 1000 caractères, puis vectorisé avec `text-embedding-3-small`.
+1. **Ingestion** : le texte du fichier est extrait (numéros de page conservés pour les PDF), découpé en fragments de 1000 caractères, puis vectorisé avec `gemini-embedding-2`.
 2. **Reformulation** : une question de suivi (« et pour les mineurs ? ») est réécrite en question autonome avant la recherche.
 3. **Recherche** : les fragments les plus proches sont récupérés ; ceux dont la similarité cosinus est sous le seuil sont écartés, pour ne pas donner de contexte hors sujet au modèle.
-4. **Génération** : Claude répond uniquement à partir des extraits, cite ses sources `[n]`, et le dit clairement quand l'information n'y figure pas.
+4. **Génération** : le modèle répond uniquement à partir des extraits, cite ses sources `[n]`, et le dit clairement quand l'information n'y figure pas.
 
 Un document de démonstration (`backend/demo_docs/`) est indexé automatiquement au démarrage. Les documents ajoutés par un visiteur sont isolés dans sa session et supprimés après 24 h.
 
@@ -28,7 +28,7 @@ Un document de démonstration (`backend/demo_docs/`) est indexé automatiquement
 cd backend
 python -m venv .venv && .venv/Scripts/activate   # ou source .venv/bin/activate
 pip install -r requirements.txt
-cp .env.example .env   # puis renseignez ANTHROPIC_API_KEY et OPENAI_API_KEY
+cp .env.example .env   # puis renseignez GEMINI_API_KEY (gratuite)
 python manage.py migrate
 python manage.py runserver
 
@@ -42,11 +42,10 @@ npm run dev
 
 | Variable | Défaut | Rôle |
 |---|---|---|
-| `ANTHROPIC_API_KEY` | — | Clé Claude pour la génération (obligatoire) |
-| `OPENAI_API_KEY` | — | Clé OpenAI pour les embeddings (obligatoire) |
-| `CLAUDE_MODEL` | `claude-opus-5` | Modèle de génération |
-| `CLAUDE_ANSWER_EFFORT` | `medium` | Effort de raisonnement des réponses |
-| `OPENAI_EMBEDDING_MODEL` | `text-embedding-3-small` | Modèle d'embeddings |
+| `GEMINI_API_KEY` | — | Clé Gemini, gratuite (obligatoire) |
+| `GEMINI_MODELS` | `gemini-3.8-flash,gemini-3.5-flash,gemini-3.5-flash-lite` | Modèles essayés dans l'ordre quand un quota gratuit est épuisé |
+| `GEMINI_ANSWER_THINKING` | `LOW` | Niveau de réflexion des réponses |
+| `GEMINI_EMBEDDING_MODEL` | `gemini-embedding-2` | Modèle d'embeddings (768 dimensions) |
 | `RAG_TOP_K` | `4` | Nombre d'extraits envoyés au modèle |
 | `RAG_MIN_RELEVANCE` | `0.3` | Similarité cosinus minimale d'un extrait |
 | `RAG_DATA_DIR` | `backend/rag_data` | Dossier des index FAISS |
@@ -54,16 +53,16 @@ npm run dev
 
 ## Protection des clés et limites d'usage
 
-Les clés ne quittent jamais le serveur : le frontend n'appelle que l'API Django. Pour une démo publique, l'API applique :
+La clé ne quitte jamais le serveur : le frontend n'appelle que l'API Django. L'offre gratuite de Gemini ne facture jamais ; pour rester sous ses quotas et répartir l'accès entre visiteurs, l'API applique :
 
 | Variable | Défaut | Limite |
 |---|---|---|
-| `RAG_DAILY_BUDGET_USD` | `2.0` | Budget quotidien global, calculé sur la consommation réelle de tokens |
+| `RAG_MAX_QUESTIONS_GLOBAL_PER_DAY` | `300` | Questions par jour pour tout le site |
 | `RAG_MAX_QUESTIONS_PER_HOUR` | `20` | Questions par visiteur et par heure |
 | `RAG_MAX_QUESTIONS_PER_DAY` | `60` | Questions par visiteur et par jour |
 | `RAG_MAX_DOCUMENTS_PER_SESSION` | `5` | Documents par session |
 
-Au-delà, l'API répond `429` avec un message explicite. Le plafond de dépense mensuel défini dans les consoles Anthropic et OpenAI reste la protection ultime.
+Au-delà, l'API répond `429` avec un message explicite.
 
 ## API
 

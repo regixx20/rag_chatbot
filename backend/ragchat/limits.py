@@ -2,12 +2,12 @@
 
 Three independent guards, all configurable through environment variables:
 - per visitor (hashed IP): questions per hour and per day;
-- global: a daily budget in US dollars, computed from the real token usage
-  reported by the Claude API;
+- global: a daily number of questions for the whole site, kept under the
+  Gemini free-tier quotas;
 - uploads: documents per session and per visitor per day.
 
-This is a safety net inside the app. The hard cap remains the monthly spend
-limit configured in the Anthropic and OpenAI consoles.
+The Gemini free tier never bills: past its quotas the API refuses requests
+instead, so these limits keep the demo usable for everyone.
 """
 from __future__ import annotations
 
@@ -16,14 +16,13 @@ import os
 from datetime import timedelta
 
 from django.conf import settings
-from django.db.models import Sum
 from django.utils import timezone
 
 from .models import Document, UsageRecord
 
 MAX_QUESTIONS_PER_HOUR = int(os.getenv("RAG_MAX_QUESTIONS_PER_HOUR", "20"))
 MAX_QUESTIONS_PER_DAY = int(os.getenv("RAG_MAX_QUESTIONS_PER_DAY", "60"))
-DAILY_BUDGET_USD = float(os.getenv("RAG_DAILY_BUDGET_USD", "2.0"))
+MAX_QUESTIONS_GLOBAL_PER_DAY = int(os.getenv("RAG_MAX_QUESTIONS_GLOBAL_PER_DAY", "300"))
 MAX_DOCUMENTS_PER_SESSION = int(os.getenv("RAG_MAX_DOCUMENTS_PER_SESSION", "5"))
 MAX_UPLOADS_PER_DAY = int(os.getenv("RAG_MAX_UPLOADS_PER_DAY", "15"))
 
@@ -43,9 +42,11 @@ def _start_of_day():
     return timezone.now().replace(hour=0, minute=0, second=0, microsecond=0)
 
 
-def spent_today() -> float:
-    total = UsageRecord.objects.filter(created_at__gte=_start_of_day()).aggregate(Sum("cost_usd"))
-    return float(total["cost_usd__sum"] or 0.0)
+def global_quota_reached() -> bool:
+    questions_today = UsageRecord.objects.filter(
+        kind=UsageRecord.QUESTION, created_at__gte=_start_of_day()
+    ).count()
+    return questions_today >= MAX_QUESTIONS_GLOBAL_PER_DAY
 
 
 def check_question(request) -> None:
@@ -53,7 +54,7 @@ def check_question(request) -> None:
     now = timezone.now()
     questions = UsageRecord.objects.filter(client_id=visitor, kind=UsageRecord.QUESTION)
 
-    if spent_today() >= DAILY_BUDGET_USD:
+    if global_quota_reached():
         raise LimitExceeded(
             "La démo a atteint sa limite d'utilisation pour aujourd'hui. Revenez demain !"
         )
@@ -80,7 +81,7 @@ def check_upload(request, session_id: str) -> None:
     ).count()
     if uploads_today >= MAX_UPLOADS_PER_DAY:
         raise LimitExceeded("Limite d'ajout de documents atteinte pour aujourd'hui. Revenez demain !")
-    if spent_today() >= DAILY_BUDGET_USD:
+    if global_quota_reached():
         raise LimitExceeded("La démo a atteint sa limite d'utilisation pour aujourd'hui. Revenez demain !")
 
 

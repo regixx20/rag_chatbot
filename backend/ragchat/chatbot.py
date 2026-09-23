@@ -7,10 +7,10 @@ Knowledge is split in two kinds of FAISS indexes stored on disk:
 
 A question is answered in four steps: condense it with the conversation history,
 retrieve the most relevant chunks from both indexes, drop the ones under a relevance
-threshold, then ask Claude to answer from those numbered extracts only.
+threshold, then ask the model to answer from those numbered extracts only.
 
-Generation runs on Claude (Anthropic API); embeddings stay on OpenAI, since Anthropic
-does not provide an embeddings endpoint.
+Both generation and embeddings run on the Gemini API free tier (one key, no cost).
+When a model's free quota is exhausted, the request falls back to lighter models.
 """
 from __future__ import annotations
 
@@ -21,6 +21,7 @@ import logging
 import os
 import shutil
 import threading
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, Iterator
@@ -28,8 +29,11 @@ from typing import Iterable, Iterator
 from langchain_community.document_loaders import Docx2txtLoader, PyPDFLoader
 from langchain_community.vectorstores import FAISS
 from langchain_core.documents import Document
-import anthropic
-from langchain_openai import OpenAIEmbeddings
+import numpy as np
+from google import genai
+from google.genai import errors as genai_errors
+from google.genai import types
+from langchain_core.embeddings import Embeddings
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 
 logger = logging.getLogger(__name__)
@@ -38,22 +42,19 @@ BACKEND_DIR = Path(__file__).resolve().parent.parent
 DEMO_DOCS_DIR = Path(os.getenv("RAG_DEMO_DOCS_DIR", BACKEND_DIR / "demo_docs"))
 DATA_DIR = Path(os.getenv("RAG_DATA_DIR", BACKEND_DIR / "rag_data"))
 
-CHAT_MODEL = os.getenv("CLAUDE_MODEL", "claude-opus-5")
-# Effort drives thinking depth and token spend; "low"/"medium" hold quality well on
-# RAG answers, where the heavy lifting is done by retrieval.
-ANSWER_EFFORT = os.getenv("CLAUDE_ANSWER_EFFORT", "medium")
-ANSWER_MAX_TOKENS = int(os.getenv("CLAUDE_ANSWER_MAX_TOKENS", "4000"))
-
-# $ per million tokens (input, output), to enforce the daily budget from real usage.
-# Unknown models are billed at the most expensive rate, so the budget stays safe.
-MODEL_PRICES = {
-    "claude-opus-5": (5.0, 25.0),
-    "claude-opus-4-8": (5.0, 25.0),
-    "claude-sonnet-5": (2.0, 10.0),
-    "claude-haiku-4-5": (1.0, 5.0),
-}
-DEFAULT_PRICE = (10.0, 50.0)
-EMBEDDING_MODEL = os.getenv("OPENAI_EMBEDDING_MODEL", "text-embedding-3-small")
+# Tried in order: when a model's free-tier quota is exhausted (HTTP 429) the next one
+# answers instead. Override with a comma-separated list.
+CHAT_MODELS = [
+    model.strip()
+    for model in os.getenv(
+        "GEMINI_MODELS", "gemini-3.8-flash,gemini-3.5-flash,gemini-3.5-flash-lite"
+    ).split(",")
+    if model.strip()
+]
+ANSWER_THINKING = os.getenv("GEMINI_ANSWER_THINKING", "LOW")
+ANSWER_MAX_TOKENS = int(os.getenv("GEMINI_ANSWER_MAX_TOKENS", "4000"))
+EMBEDDING_MODEL = os.getenv("GEMINI_EMBEDDING_MODEL", "gemini-embedding-2")
+EMBEDDING_DIMENSIONS = int(os.getenv("GEMINI_EMBEDDING_DIMENSIONS", "768"))
 TOP_K = int(os.getenv("RAG_TOP_K", "4"))
 # Cosine similarity between the question and a chunk (1 = identical meaning).
 # Chunks below this score are ignored instead of being fed to the LLM.
@@ -89,7 +90,7 @@ class Source:
 
 @dataclass
 class PreparedAnswer:
-    """Everything needed to call Claude, computed before the (possibly streamed) call."""
+    """Everything needed to call the model, computed before the (possibly streamed) call."""
 
     system: str
     messages: list[dict]
@@ -103,18 +104,67 @@ class PreparedAnswer:
 class StreamResult:
     """Filled once the stream is over."""
 
-    cost_usd: float = 0.0
+    cost_usd: float = 0.0  # always 0 on the free tier, kept for the usage records
     stop_reason: str | None = None
+    model: str | None = None
 
 
-def usage_cost(model: str, usage) -> float:
-    input_price, output_price = MODEL_PRICES.get(model, DEFAULT_PRICE)
-    input_tokens = (
-        (usage.input_tokens or 0)
-        + (getattr(usage, "cache_creation_input_tokens", 0) or 0) * 1.25
-        + (getattr(usage, "cache_read_input_tokens", 0) or 0) * 0.1
-    )
-    return (input_tokens * input_price + (usage.output_tokens or 0) * output_price) / 1_000_000
+class QuotaExhausted(RuntimeError):
+    """Every configured model is out of free-tier quota for now."""
+
+    MESSAGE = "Le quota gratuit du modèle est momentanément épuisé. Réessayez dans une minute."
+
+
+def _is_quota_error(error: Exception) -> bool:
+    return isinstance(error, genai_errors.ClientError) and error.code in (404, 429)
+
+
+# ----------------------------------------------------------------------
+# Embeddings
+# ----------------------------------------------------------------------
+class GeminiEmbeddings(Embeddings):
+    """LangChain embeddings backed by the Gemini API.
+
+    gemini-embedding-2 merges a plain list of strings into ONE vector, so each text
+    is sent as its own Content. The task is given as a text prefix (this model has no
+    task_type), and vectors are L2-normalised: the FAISS scoring assumes unit vectors.
+    """
+
+    BATCH_SIZE = 50
+
+    def __init__(self, client: genai.Client) -> None:
+        self.client = client
+
+    def _embed(self, texts: list[str]) -> list[list[float]]:
+        vectors: list[list[float]] = []
+        for start in range(0, len(texts), self.BATCH_SIZE):
+            batch = texts[start : start + self.BATCH_SIZE]
+            contents = [types.Content(parts=[types.Part(text=text)]) for text in batch]
+            for attempt in range(4):
+                try:
+                    response = self.client.models.embed_content(
+                        model=EMBEDDING_MODEL,
+                        contents=contents,
+                        config=types.EmbedContentConfig(output_dimensionality=EMBEDDING_DIMENSIONS),
+                    )
+                    break
+                except genai_errors.ClientError as error:
+                    # Free tier: requests per minute are limited, wait and retry
+                    if error.code != 429 or attempt == 3:
+                        raise
+                    time.sleep(2 ** attempt * 5)
+            for embedding in response.embeddings:
+                vector = np.asarray(embedding.values, dtype="float32")
+                vectors.append((vector / (np.linalg.norm(vector) or 1.0)).tolist())
+        if len(vectors) != len(texts):
+            raise RuntimeError("Le nombre de vecteurs ne correspond pas au nombre de textes.")
+        return vectors
+
+    def embed_documents(self, texts: list[str]) -> list[list[float]]:
+        return self._embed([f"title: none | text: {text}" for text in texts])
+
+    def embed_query(self, text: str) -> list[float]:
+        return self._embed([f"task: search result | query: {text}"])[0]
 
 
 # ----------------------------------------------------------------------
@@ -178,7 +228,7 @@ class IndexStore:
     """FAISS indexes persisted on disk, cached in memory and reloaded when changed on disk
     (several gunicorn workers may write to the same index)."""
 
-    def __init__(self, root: Path, embeddings: OpenAIEmbeddings) -> None:
+    def __init__(self, root: Path, embeddings: Embeddings) -> None:
         self.root = root
         self.embeddings = embeddings
         self._cache: dict[str, tuple[float, FAISS]] = {}
@@ -254,19 +304,17 @@ class IndexStore:
 # ----------------------------------------------------------------------
 class ChatbotEngine:
     def __init__(self) -> None:
-        openai_key = os.getenv("OPENAI_API_KEY")
-        if not openai_key:
-            raise RuntimeError("OPENAI_API_KEY must be provided in the environment (embeddings).")
-        if not os.getenv("ANTHROPIC_API_KEY"):
-            raise RuntimeError("ANTHROPIC_API_KEY must be provided in the environment.")
+        api_key = os.getenv("GEMINI_API_KEY")
+        if not api_key:
+            raise RuntimeError("GEMINI_API_KEY must be provided in the environment.")
 
-        # Explicit timeout: without it a stuck call keeps the request open for minutes
-        self.claude = anthropic.Anthropic(timeout=60.0, max_retries=2)
-        self.embeddings = OpenAIEmbeddings(api_key=openai_key, model=EMBEDDING_MODEL)
+        # Explicit timeout (ms): without it a stuck call keeps the request open for minutes
+        self.gemini = genai.Client(api_key=api_key, http_options=types.HttpOptions(timeout=60_000))
+        self.embeddings = GeminiEmbeddings(self.gemini)
         self.splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=150)
         self.indexes = IndexStore(DATA_DIR / "indexes", self.embeddings)
         self._demo_lock = threading.Lock()
-        logger.info("Moteur RAG prêt (chat=%s, embeddings=%s)", CHAT_MODEL, EMBEDDING_MODEL)
+        logger.info("Moteur RAG prêt (chat=%s, embeddings=%s)", CHAT_MODELS, EMBEDDING_MODEL)
 
     # -- Demo corpus ----------------------------------------------------
     def demo_files(self) -> list[Path]:
@@ -279,7 +327,7 @@ class ChatbotEngine:
         )
 
     def _demo_fingerprint(self) -> str:
-        digest = hashlib.sha256(EMBEDDING_MODEL.encode())
+        digest = hashlib.sha256(f"{EMBEDDING_MODEL}:{EMBEDDING_DIMENSIONS}".encode())
         for path in self.demo_files():
             digest.update(path.name.encode())
             digest.update(path.read_bytes())
@@ -334,7 +382,7 @@ class ChatbotEngine:
         for key in (self.session_key(session_id), DEMO_INDEX):
             store = self.indexes.get(key)
             if store is not None:
-                # FAISS returns squared L2 distances; OpenAI embeddings are unit vectors,
+                # FAISS returns squared L2 distances; embeddings are unit vectors,
                 # so cosine similarity = 1 - d² / 2
                 candidates.extend(
                     (doc, 1 - float(distance) / 2)
@@ -365,33 +413,50 @@ class ChatbotEngine:
             for i, (doc, score) in enumerate(relevant)
         ]
 
-    # -- Claude calls -----------------------------------------------------------
+    # -- Gemini calls -----------------------------------------------------------
     @staticmethod
-    def _request_options(effort: str) -> dict:
-        options: dict = {"output_config": {"effort": effort}}
-        # On a safety decline, let the API re-run the request on its recommended
-        # fallback model instead of returning a refusal (Claude Opus 5 / Fable).
-        if CHAT_MODEL.startswith(("claude-opus-5", "claude-fable")):
-            options["betas"] = ["server-side-fallback-2026-07-01"]
-            options["fallbacks"] = "default"
-        return options
-
-    def _complete(self, system: str, messages: list[dict], effort: str, max_tokens: int):
-        """Streamed under the hood (no HTTP timeout risk), returns the final message."""
-        with self.claude.beta.messages.stream(
-            model=CHAT_MODEL,
-            max_tokens=max_tokens,
-            system=system,
-            messages=messages,
-            **self._request_options(effort),
-        ) as stream:
-            return stream.get_final_message()
+    def _config(system: str, thinking: str, max_tokens: int) -> types.GenerateContentConfig:
+        return types.GenerateContentConfig(
+            system_instruction=system,
+            max_output_tokens=max_tokens,
+            thinking_config=types.ThinkingConfig(thinking_level=thinking),
+        )
 
     @staticmethod
-    def _text_of(message) -> str:
-        if message.stop_reason == "refusal":
-            return ""
-        return "".join(block.text for block in message.content if block.type == "text").strip()
+    def _contents(messages: list[dict]) -> list[types.Content]:
+        return [
+            types.Content(
+                role="user" if message["role"] == "user" else "model",
+                parts=[types.Part(text=message["content"])],
+            )
+            for message in messages
+        ]
+
+    def _open_stream(self, system: str, messages: list[dict], thinking: str, max_tokens: int):
+        """Start a stream on the first model that has quota left.
+        Returns (model, first_chunk, iterator) so the fallback happens before any text is sent."""
+        last_error: Exception | None = None
+        for model in CHAT_MODELS:
+            try:
+                iterator = iter(
+                    self.gemini.models.generate_content_stream(
+                        model=model,
+                        contents=self._contents(messages),
+                        config=self._config(system, thinking, max_tokens),
+                    )
+                )
+                return model, next(iterator, None), iterator
+            except genai_errors.ClientError as error:
+                if not _is_quota_error(error):
+                    raise
+                logger.warning("Quota épuisé ou modèle indisponible (%s), modèle suivant", model)
+                last_error = error
+        raise QuotaExhausted(QuotaExhausted.MESSAGE) from last_error
+
+    def _complete(self, system: str, messages: list[dict], thinking: str, max_tokens: int) -> str:
+        _, first, iterator = self._open_stream(system, messages, thinking, max_tokens)
+        chunks = [first, *iterator] if first is not None else []
+        return "".join(chunk.text or "" for chunk in chunks).strip()
 
     # -- Prompting ------------------------------------------------------------
     @staticmethod
@@ -402,7 +467,7 @@ class ChatbotEngine:
             if content:
                 role = "user" if entry.get("role") == "user" else "assistant"
                 messages.append({"role": role, "content": content})
-        # The conversation sent to Claude must start with a user turn
+        # The conversation sent to the model must start with a user turn
         while messages and messages[0]["role"] != "user":
             messages.pop(0)
         return messages
@@ -417,7 +482,7 @@ class ChatbotEngine:
             for m in history[-4:]
         )
         try:
-            response = self._complete(
+            rewritten = self._complete(
                 system=(
                     "Tu reformules la dernière question d'une conversation en une question autonome, "
                     "compréhensible sans l'historique, dans la même langue que la question. "
@@ -429,13 +494,12 @@ class ChatbotEngine:
                         "content": f"Historique :\n{transcript}\n\nDernière question : {message}",
                     }
                 ],
-                effort="low",
+                thinking="LOW",
                 max_tokens=1024,
             )
-            rewritten = self._text_of(response)
             logger.info("Question reformulée : %s -> %s", message, rewritten)
-            return rewritten or message, usage_cost(CHAT_MODEL, response.usage)
-        except anthropic.APIError:
+            return rewritten or message, 0.0
+        except genai_errors.APIError:
             logger.exception("Échec de la reformulation, question d'origine utilisée")
             return message, 0.0
 
@@ -501,31 +565,29 @@ class ChatbotEngine:
     TRUNCATED_TEXT = "\n\n*(Réponse tronquée : la limite de longueur a été atteinte.)*"
 
     def stream(self, prepared: PreparedAnswer, result: StreamResult | None = None) -> Iterator[str]:
-        """Yield the answer text as it is generated. `result` receives the cost and
-        stop reason once the stream is over."""
+        """Yield the answer text as it is generated. `result` receives the model used
+        and the finish reason once the stream is over."""
         result = result or StreamResult()
-        with self.claude.beta.messages.stream(
-            model=CHAT_MODEL,
-            max_tokens=ANSWER_MAX_TOKENS,
-            system=prepared.system,
-            messages=prepared.messages,
-            **self._request_options(ANSWER_EFFORT),
-        ) as stream:
-            yielded = False
-            for text in stream.text_stream:
-                yielded = yielded or bool(text)
-                yield text
-            final = stream.get_final_message()
-
-        result.stop_reason = final.stop_reason
-        result.cost_usd = prepared.cost_usd + usage_cost(CHAT_MODEL, final.usage)
-        if final.stop_reason == "refusal" and not yielded:
-            yield self.REFUSAL_TEXT
-        elif final.stop_reason == "max_tokens":
-            yield self.TRUNCATED_TEXT
-        logger.info(
-            "Réponse générée (%s, arrêt=%s, coût=%.4f $)", prepared.intent, final.stop_reason, result.cost_usd
+        model, first, iterator = self._open_stream(
+            prepared.system, prepared.messages, ANSWER_THINKING, ANSWER_MAX_TOKENS
         )
+        result.model = model
+        yielded = False
+        finish_reason = None
+        for chunk in ([first, *iterator] if first is not None else []):
+            if chunk.candidates and chunk.candidates[0].finish_reason:
+                finish_reason = chunk.candidates[0].finish_reason.name
+            if chunk.text:
+                yielded = True
+                yield chunk.text
+
+        result.stop_reason = finish_reason
+        if finish_reason == "MAX_TOKENS":
+            yield self.TRUNCATED_TEXT
+        elif not yielded:
+            # Blocked by safety filters (SAFETY, PROHIBITED_CONTENT…) or empty answer
+            yield self.REFUSAL_TEXT
+        logger.info("Réponse générée (%s, modèle=%s, fin=%s)", prepared.intent, model, finish_reason)
 
     def answer(self, prepared: PreparedAnswer, result: StreamResult | None = None) -> str:
         return "".join(self.stream(prepared, result))

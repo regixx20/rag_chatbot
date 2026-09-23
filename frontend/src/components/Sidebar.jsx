@@ -119,7 +119,10 @@ export function Sidebar({
           )}
         </ul>
 
-        <p className="kb-note">Vos fichiers ne sont visibles que par vous et sont effacés après 24 h.</p>
+        <p className="kb-note">
+          Vos fichiers ne sont visibles que par vous et sont effacés après 24 h. La démo utilise l'offre
+          gratuite de Gemini : n'envoyez pas de documents confidentiels.
+        </p>
       </section>
 
       <div className="sidebar-foot">
